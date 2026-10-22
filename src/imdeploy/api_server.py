@@ -63,6 +63,19 @@ button.primary:hover{color:#06101f;filter:brightness(1.12)}
 input{background:var(--panel2);border:1px solid var(--border);border-radius:7px;padding:8px 12px;
 color:var(--text);font-family:inherit;font-size:13px;flex:1;min-width:180px}
 input:focus{outline:none;border-color:var(--accent)}
+select{background:var(--panel2);border:1px solid var(--border);border-radius:7px;padding:8px 12px;
+color:var(--text);font-family:inherit;font-size:13px;width:100%}
+select:focus{outline:none;border-color:var(--accent)}
+.fl{display:block;font-size:12px;color:var(--dim);margin-bottom:4px}
+.sw{display:inline-flex;align-items:center;cursor:pointer}
+.sw input{display:none}
+.sw .track{width:38px;height:21px;border-radius:11px;background:var(--panel2);
+border:1px solid var(--border);position:relative;transition:.2s;display:block}
+.sw .track::after{content:'';position:absolute;width:15px;height:15px;border-radius:50%;
+background:var(--dim);top:2px;left:2px;transition:.2s}
+.sw input:checked + .track{background:rgba(88,166,255,.25);border-color:var(--accent)}
+.sw input:checked + .track::after{left:20px;background:var(--accent)}
+h3{font-weight:600}
 table{width:100%;border-collapse:collapse;font-size:13px}
 th{text-align:left;padding:8px 10px;color:var(--dim);font-weight:500;border-bottom:1px solid var(--border);font-size:12px}
 td{padding:8px 10px;border-bottom:1px solid rgba(48,54,61,.5)}
@@ -100,6 +113,16 @@ height:180px;overflow-y:auto;font-family:Consolas,monospace;font-size:12px;color
 <div class="card">
   <h2>下载进度</h2>
   <div id="dlBox"><span class="tip">暂无下载任务</span></div>
+</div>
+
+<div class="card">
+  <h2>设置</h2>
+  <div class="row">
+    <button onclick="loadConfig()">刷新</button>
+    <button class="primary" onclick="saveConfig()">保存全部</button>
+    <span class="tip" id="cfgTip"></span>
+  </div>
+  <div id="cfgBox"><span class="tip">正在读取配置…</span></div>
 </div>
 
 <div class="card">
@@ -141,6 +164,81 @@ function log(msg){
   const el = $('log');
   el.textContent = msg;
   el.scrollTop = el.scrollHeight;
+}
+
+async function loadConfig(){
+  const box = document.getElementById('cfgBox');
+  const tip = document.getElementById('cfgTip');
+  try{
+    const r = await fetch(base + '/api/config');
+    const d = await r.json();
+    if(!d.ok){ box.innerHTML = '<span class="tip">读取失败</span>'; return; }
+    const fields = d.fields || {};
+    const secs = d.section_fields || {};
+    const titles = d.sections || {};
+    let html = '';
+    for(const sec of Object.keys(secs)){
+      html += '<h3 style="font-size:13px;color:var(--dim);margin:14px 0 6px;font-weight:600">'
+           + (titles[sec] || sec) + '</h3>';
+      html += '<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:10px">';
+      for(const key of secs[sec]){
+        const f = fields[key];
+        if(!f) continue;
+        const id = 'cfg_' + key.replace(/\./g, '_');
+        let ctrl;
+        if(f.options && f.options.length){
+          ctrl = '<select id="' + id + '" data-key="' + key + '">'
+            + f.options.map(o => '<option value="' + o.value + '"'
+                + (String(f.value) === String(o.value) ? ' selected' : '') + '>'
+                + o.label + '</option>').join('')
+            + '</select>';
+        } else if(f.type === 'bool'){
+          ctrl = '<label class="sw"><input type="checkbox" id="' + id + '" data-key="' + key + '"'
+            + (f.value ? ' checked' : '') + '><span class="track"></span></label>';
+        } else if(f.type === 'int' || f.type === 'float'){
+          ctrl = '<input type="number" id="' + id + '" data-key="' + key + '" value="' + f.value
+            + '"' + (f.type === 'float' ? ' step="0.1"' : ' step="1"') + '>';
+        } else {
+          const secret = /token|key|password|secret/i.test(key);
+          ctrl = '<input type="' + (secret ? 'password' : 'text') + '" id="' + id
+            + '" data-key="' + key + '" value="' + String(f.value == null ? '' : f.value) + '">';
+        }
+        html += '<div><label class="fl">' + f.label + '</label>' + ctrl
+          + '<div class="tip">' + (f.default !== undefined && f.default !== '' && f.default !== f.value
+              ? '默认 ' + f.default : '') + '</div></div>';
+      }
+      html += '</div>';
+    }
+    box.innerHTML = html;
+    tip.textContent = Object.keys(fields).length + ' 项';
+  }catch(e){ box.innerHTML = '<span class="tip">读取失败：' + e + '</span>'; }
+}
+
+async function saveConfig(){
+  const tip = document.getElementById('cfgTip');
+  const upd = {};
+  document.querySelectorAll('#cfgBox [data-key]').forEach(el => {
+    const key = el.getAttribute('data-key');
+    if(el.type === 'checkbox') upd[key] = el.checked;
+    else if(el.type === 'number'){
+      const n = parseFloat(el.value);
+      if(!isNaN(n)) upd[key] = Number.isInteger(n) ? n : n;
+    }
+    else upd[key] = el.value;
+  });
+  try{
+    const r = await fetch(base + '/api/config', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({config: upd})
+    });
+    const d = await r.json();
+    if(d.ok){
+      tip.textContent = '已保存 ' + (d.saved || []).length + ' 项';
+      setTimeout(() => tip.textContent = '', 3000);
+    } else {
+      tip.textContent = '保存失败：' + (d.error || '');
+    }
+  }catch(e){ tip.textContent = '请求失败：' + e; }
 }
 
 async function loadStatus(){
@@ -264,7 +362,7 @@ async function pollDownloads(){
   }catch(e){}
 }
 
-loadStatus(); loadModels(); pollDownloads();
+loadStatus(); loadModels(); pollDownloads(); loadConfig();
 setInterval(loadStatus, 5000);
 setInterval(pollDownloads, 2000);
 </script>
@@ -589,6 +687,109 @@ class ApiServer:
         with self._lock:
             return {k: dict(v) for k, v in self._downloads.items()}
 
+    def update_config(self, updates: dict[str, Any]) -> dict[str, Any]:
+        """更新配置（WebUI 表单提交），只接受已存在的键。"""
+        if not isinstance(updates, dict):
+            return {"ok": False, "error": "config 必须是对象"}
+
+        changed: list[str] = []
+        for dotted, value in updates.items():
+            if not isinstance(dotted, str) or "." not in dotted:
+                continue
+            # 只允许写已存在的配置项，避免拼错键名写出一堆垃圾
+            current = self.cfg.get(dotted, None)
+            if current is None and not _config_key_exists(self.cfg, dotted):
+                continue
+            if current == value:
+                continue
+            self.cfg.set(dotted, value)
+            changed.append(dotted)
+
+        if changed:
+            try:
+                self.cfg.save()
+            except Exception as exc:  # noqa: BLE001
+                return {"ok": False, "error": f"保存失败：{exc}", "saved": []}
+        return {"ok": True, "saved": changed}
+
+
+# ---------------------------------------------------------------- 配置辅助
+
+
+def _config_key_exists(cfg, dotted: str) -> bool:
+    """检查点分键是否存在（只按配置本身的结构判断，不看默认值）。"""
+    node: Any = cfg
+    for part in dotted.split("."):
+        if isinstance(node, dict) and part in node:
+            node = node[part]
+        else:
+            return False
+    return True
+
+
+def _config_payload(cfg) -> dict[str, Any]:
+    """给前端渲染表单用的配置负载。
+
+    每个字段带上类型信息，前端据此决定用 input / number / select / switch。
+    """
+    from .config import DEFAULT_CONFIG, FIELD_LABELS, SECTION_TITLES, VALUE_HINTS
+
+    def walk(node: Any, prefix: str = "") -> dict[str, Any]:
+        out: dict[str, Any] = {}
+        if not isinstance(node, dict):
+            return out
+        for key, value in node.items():
+            dotted = f"{prefix}{key}"
+            if isinstance(value, dict):
+                nested = walk(value, f"{dotted}.")
+                if nested:
+                    out.update(nested)
+            else:
+                out[dotted] = value
+        return out
+
+    values = walk(getattr(cfg, "_data", {}) or {})
+    fields: dict[str, Any] = {}
+    for dotted, value in values.items():
+        default = None
+        node: Any = DEFAULT_CONFIG
+        for part in dotted.split("."):
+            if isinstance(node, dict) and part in node:
+                node = node[part]
+            else:
+                node = None
+                break
+        if node is not None and not isinstance(node, dict):
+            default = node
+        ftype = ("bool" if isinstance(value, bool)
+                 else "int" if isinstance(value, int)
+                 else "float" if isinstance(value, float)
+                 else "text")
+        entry: dict[str, Any] = {
+            "value": value,
+            "type": ftype,
+            "label": FIELD_LABELS.get(dotted, dotted.split(".")[-1]),
+        }
+        # 枚举型：hints 里登记了候选值就用下拉
+        opts = VALUE_HINTS.get(dotted)
+        if opts:
+            entry["options"] = [{"value": k, "label": v, "hint": ""}
+                                for k, v in opts.items()]
+        elif default is not None and not isinstance(default, (dict, list)):
+            entry["default"] = default
+        fields[dotted] = entry
+
+    sections: dict[str, list[str]] = {}
+    for dotted in fields:
+        sections.setdefault(dotted.split(".")[0], []).append(dotted)
+
+    return {
+        "ok": True,
+        "fields": fields,
+        "sections": {k: SECTION_TITLES.get(k, k) for k in sections},
+        "section_fields": sections,
+    }
+
 
 # ---------------------------------------------------------------- Handler
 
@@ -694,6 +895,10 @@ def create_handler(server: ApiServer) -> type[BaseHTTPRequestHandler]:
                 self._send_json({"ok": True, "tasks": server.download_status()})
                 server.stats.count_request()
                 return
+            if path == "/api/config":
+                self._send_json(_config_payload(server.cfg))
+                server.stats.count_request()
+                return
             if path in ("/", "/index.html", "/ui", "/docs"):
                 self._send_html(_WEBUI_HTML)
                 server.stats.count_request()
@@ -774,6 +979,10 @@ def create_handler(server: ApiServer) -> type[BaseHTTPRequestHandler]:
                     self._send_error_json("缺少 model_id", "invalid_request_error", 400, "missing_model_id")
                     return
                 res = server.start_download(mid)
+                self._send_json(res, 200 if res.get("ok") else 400)
+                server.stats.count_request(failed=not res.get("ok"))
+            elif path == "/api/config":
+                res = server.update_config(payload.get("config") or {})
                 self._send_json(res, 200 if res.get("ok") else 400)
                 server.stats.count_request(failed=not res.get("ok"))
             elif path.startswith("/api/") and len(path) > 5:
