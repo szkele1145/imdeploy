@@ -32,7 +32,7 @@ __all__ = ["ApiServer", "create_handler", "build_server", "main"]
 
 # ---------------------------------------------------------------- 内置网页面板
 
-_WEBUI_HTML = """<!DOCTYPE html>
+_WEBUI_HTML = r"""
 <html lang="zh-CN">
 <head>
 <meta charset="utf-8">
@@ -132,8 +132,8 @@ height:180px;overflow-y:auto;font-family:Consolas,monospace;font-size:12px;color
     <span class="tip" id="modelTip"></span>
   </div>
   <table>
-    <thead><tr><th>模型</th><th>系列</th><th>参数量</th><th>上下文</th><th>量化</th></tr></thead>
-    <tbody id="modelBody"><tr><td colspan="5" style="color:var(--dim)">暂无已下载模型</td></tr></tbody>
+    <thead><tr><th>模型</th><th>系列</th><th>参数量</th><th>上下文</th><th>量化</th><th>操作</th></tr></thead>
+    <tbody id="modelBody"><tr><td colspan="6" style="color:var(--dim)">暂无已下载模型</td></tr></tbody>
   </table>
 </div>
 
@@ -269,16 +269,60 @@ async function loadModels(){
     const d = await r.json();
     const items = d.data || [];
     if(!items.length){
-      $('modelBody').innerHTML = '<tr><td colspan="5" style="color:var(--dim)">暂无已下载模型，请把 GGUF 放进 models 目录</td></tr>';
+      $('modelBody').innerHTML = '<tr><td colspan="6" style="color:var(--dim)">暂无已下载模型，请把 GGUF 放进 models 目录</td></tr>';
       $('modelTip').textContent = '';
       return;
     }
-    $('modelBody').innerHTML = items.map(m =>
-      '<tr><td>' + m.id + '</td><td>-</td><td>-</td><td>-</td><td>-</td></tr>').join('');
+    // 查哪些已加载
+    let loaded = {};
+    try{
+      const lr = await fetch(base + '/api/loaded');
+      const ld = await lr.json();
+      loaded = ld.models || {};
+    }catch(e){}
+
+    $('modelBody').innerHTML = items.map(m => {
+      const on = !!loaded[m.id];
+      const btn = on
+        ? '<button onclick="unloadModel(\'' + m.id.replace(/'/g,"\\'") + '\')">卸载</button>'
+        : '<button onclick="loadModel(\'' + m.id.replace(/'/g,"\\'") + '\')">加载</button>';
+      return '<tr><td>' + m.id + (on ? ' <span style="color:var(--ok)">● 已加载</span>' : '') + '</td>'
+        + '<td>-</td><td>-</td><td>-</td><td>-</td><td>' + btn + '</td></tr>';
+    }).join('');
     $('modelTip').textContent = '共 ' + items.length + ' 个';
   }catch(e){
-    $('modelBody').innerHTML = '<tr><td colspan="5" style="color:var(--err)">加载失败：' + e + '</td></tr>';
+    $('modelBody').innerHTML = '<tr><td colspan="6" style="color:var(--err)">加载失败：' + e + '</td></tr>';
   }
+}
+
+async function loadModel(mid){
+  $('modelTip').textContent = '正在加载 ' + mid + '…';
+  try{
+    const r = await fetch(base + '/api/load_model', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({model_id: mid})
+    });
+    const d = await r.json();
+    if(d.ok){
+      $('modelTip').textContent = '已加载 ' + mid;
+      loadModels(); loadStatus();
+    } else {
+      $('modelTip').textContent = '加载失败：' + (d.error || '未知错误');
+    }
+  }catch(e){ $('modelTip').textContent = '请求失败：' + e; }
+}
+
+async function unloadModel(mid){
+  $('modelTip').textContent = '正在卸载 ' + mid + '…';
+  try{
+    const r = await fetch(base + '/api/unload_model', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({model_id: mid})
+    });
+    const d = await r.json();
+    $('modelTip').textContent = d.ok ? ('已卸载 ' + mid) : ('卸载失败：' + (d.error || ''));
+    loadModels(); loadStatus();
+  }catch(e){ $('modelTip').textContent = '请求失败：' + e; }
 }
 
 async function ask(){
@@ -687,6 +731,85 @@ class ApiServer:
         with self._lock:
             return {k: dict(v) for k, v in self._downloads.items()}
 
+    # ---------------- 模型加载 / 卸载 ----------------
+
+    def start_model(self, model_id: str) -> dict[str, Any]:
+        """加载一个本地模型到推理后端（llama-server / Ollama）。"""
+        from . import backends as backends_mod  # noqa: PLC0415
+
+        with self._lock:
+            if model_id in self._loaded:
+                return {"ok": True, "model_id": model_id, "note": "模型已加载"}
+
+        backends = backends_mod.detect_backends(self.cfg)
+        if not backends:
+            return {"ok": False, "error": "没有可用的推理后端（找不到 llama-server？）"}
+
+        backend = next((b for b in backends if b.is_available()), backends[0])
+        try:
+            info = backend.start_model(
+                model_id,
+                ctx_size=int(self.cfg.get("backend.context_size", 8192)),
+                n_gpu_layers=int(self.cfg.get("backend.gpu_layers", 0)),
+                threads=int(self.cfg.get("backend.threads", 0)) or None,
+            )
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": False, "error": str(exc)}
+
+        base_url = info.get("base_url", "") if isinstance(info, dict) else ""
+        with self._lock:
+            self._loaded[model_id] = {
+                "backend": backend,
+                "base_url": base_url,
+                "family": info.get("family", "") if isinstance(info, dict) else "",
+                "loaded_at": time.time(),
+            }
+        return {"ok": True, "model_id": model_id, "base_url": base_url,
+                "info": {k: v for k, v in info.items() if k != "command"}
+                if isinstance(info, dict) else {}}
+
+    def stop_model(self, model_id: str = "") -> dict[str, Any]:
+        """卸载模型。model_id 为空则停掉全部。"""
+        from . import backends as backends_mod  # noqa: PLC0415
+
+        targets: list[Any] = []
+        with self._lock:
+            if model_id:
+                entry = self._loaded.get(model_id)
+                if entry:
+                    targets.append(entry["backend"])
+                else:
+                    # 可能是同一后端在不同 key 下登记
+                    targets = list({id(b): b for b in backends_mod.detect_backends(self.cfg)}.values())
+            else:
+                targets = list({id(b): b for b in backends_mod.detect_backends(self.cfg)}.values())
+
+        stopped = []
+        for b in targets:
+            try:
+                if b.stop_model():
+                    stopped.append(getattr(b, "name", str(b)))
+            except Exception:  # noqa: BLE001
+                pass
+        with self._lock:
+            if model_id:
+                self._loaded.pop(model_id, None)
+            else:
+                self._loaded.clear()
+        return {"ok": True, "stopped": stopped}
+
+    def loaded_models(self) -> dict[str, Any]:
+        """已加载模型的详细信息。"""
+        with self._lock:
+            return {
+                mid: {
+                    "base_url": v.get("base_url", ""),
+                    "backend": getattr(v.get("backend"), "name", ""),
+                    "loaded_at": v.get("loaded_at", 0),
+                }
+                for mid, v in self._loaded.items()
+            }
+
     def update_config(self, updates: dict[str, Any]) -> dict[str, Any]:
         """更新配置（WebUI 表单提交），只接受已存在的键。"""
         if not isinstance(updates, dict):
@@ -899,6 +1022,10 @@ def create_handler(server: ApiServer) -> type[BaseHTTPRequestHandler]:
                 self._send_json(_config_payload(server.cfg))
                 server.stats.count_request()
                 return
+            if path == "/api/loaded":
+                self._send_json({"ok": True, "models": server.loaded_models()})
+                server.stats.count_request()
+                return
             if path in ("/", "/index.html", "/ui", "/docs"):
                 self._send_html(_WEBUI_HTML)
                 server.stats.count_request()
@@ -983,6 +1110,20 @@ def create_handler(server: ApiServer) -> type[BaseHTTPRequestHandler]:
                 server.stats.count_request(failed=not res.get("ok"))
             elif path == "/api/config":
                 res = server.update_config(payload.get("config") or {})
+                self._send_json(res, 200 if res.get("ok") else 400)
+                server.stats.count_request(failed=not res.get("ok"))
+            elif path == "/api/load_model":
+                mid = str(payload.get("model_id") or payload.get("id") or "").strip()
+                if not mid:
+                    server.stats.count_request(failed=True)
+                    self._send_error_json("缺少 model_id", "invalid_request_error", 400, "missing_model_id")
+                    return
+                res = server.start_model(mid)
+                self._send_json(res, 200 if res.get("ok") else 400)
+                server.stats.count_request(failed=not res.get("ok"))
+            elif path == "/api/unload_model":
+                mid = str(payload.get("model_id") or payload.get("id") or "").strip()
+                res = server.stop_model(mid)
                 self._send_json(res, 200 if res.get("ok") else 400)
                 server.stats.count_request(failed=not res.get("ok"))
             elif path.startswith("/api/") and len(path) > 5:
