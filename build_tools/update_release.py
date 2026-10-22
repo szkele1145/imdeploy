@@ -14,6 +14,8 @@ ASSETS: list[tuple[str, str]] = [
      "imdeploy-setup-0.1.0.exe"),
     (r"F:\vibe coding工程\imdeploy\dist\imdeploy-linux-x86_64.tar.gz",
      "imdeploy-linux-x86_64.tar.gz"),
+    (r"F:\vibe coding工程\imdeploy\dist\imdeploy-android.apk",
+     "imdeploy-android.apk"),
 ]
 
 op = urllib.request.build_opener(
@@ -61,7 +63,9 @@ def main():
         "bash install.sh\n"
         "```\n\n"
         "装完运行 `~/.local/share/imdeploy/run.sh` 启动面板，"
-        "`run-api.sh` 只起 API 服务。"
+        "`run-api.sh` 只起 API 服务。\n\n"
+        "**Android**：下载 `imdeploy-android.apk` 安装（Android 10+），"
+        "内置 Termux 环境，首次启动会引导安装 Termux 并准备 Python 环境。"
     )
     call("PATCH", f"https://api.github.com/repos/{REPO}/releases/{rid}",
          json.dumps({"body": body}, ensure_ascii=False).encode("utf-8"),
