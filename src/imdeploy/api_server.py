@@ -1,4 +1,4 @@
-﻿"""OpenAI 兼容 API 层。
+"""OpenAI 兼容 API 层。
 
 用标准库 ``http.server.ThreadingHTTPServer`` 实现零依赖 API：
 
@@ -29,6 +29,166 @@ from .config import Config
 from .proxy import DEFAULT_ALIAS, forward_json, pick_model_for_alias
 
 __all__ = ["ApiServer", "create_handler", "build_server", "main"]
+
+# ---------------------------------------------------------------- 内置网页面板
+
+_WEBUI_HTML = """<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>ImDeploy 本地模型部署器</title>
+<style>
+:root{--bg:#0d1117;--panel:#161b22;--panel2:#1c2129;--border:#30363d;
+--text:#e6edf3;--dim:#8b949e;--accent:#58a6ff;--ok:#3fb950;--warn:#d29922;--err:#f85149}
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:var(--bg);color:var(--text);font:14px/1.6 "Microsoft YaHei UI",system-ui,sans-serif;padding:24px}
+.wrap{max-width:1080px;margin:0 auto}
+header{display:flex;align-items:center;gap:12px;margin-bottom:20px;padding-bottom:14px;border-bottom:1px solid var(--border)}
+h1{font-size:19px;font-weight:600}
+.badge{font-size:12px;padding:3px 10px;border-radius:20px;background:rgba(63,185,80,.15);color:var(--ok);border:1px solid rgba(63,185,80,.3)}
+.badge.off{background:rgba(139,148,158,.15);color:var(--dim);border-color:rgba(139,148,158,.3)}
+.card{background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:18px;margin-bottom:14px;animation:fadeUp .35s ease both}
+@keyframes fadeUp{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:none}}
+h2{font-size:14px;color:var(--accent);margin-bottom:12px;font-weight:600}
+.row{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:10px}
+.kv{display:grid;grid-template-columns:110px 1fr;gap:6px 12px;font-size:13px}
+.kv dt{color:var(--dim)}
+.kv dd{color:var(--text);word-break:break-all}
+button{background:var(--panel2);color:var(--text);border:1px solid var(--border);border-radius:7px;
+padding:8px 16px;cursor:pointer;font-size:13px;font-family:inherit;transition:.18s}
+button:hover{border-color:var(--accent);color:var(--accent);transform:translateY(-1px)}
+button.primary{background:var(--accent);color:#06101f;border-color:var(--accent);font-weight:600}
+button.primary:hover{color:#06101f;filter:brightness(1.12)}
+input{background:var(--panel2);border:1px solid var(--border);border-radius:7px;padding:8px 12px;
+color:var(--text);font-family:inherit;font-size:13px;flex:1;min-width:180px}
+input:focus{outline:none;border-color:var(--accent)}
+table{width:100%;border-collapse:collapse;font-size:13px}
+th{text-align:left;padding:8px 10px;color:var(--dim);font-weight:500;border-bottom:1px solid var(--border);font-size:12px}
+td{padding:8px 10px;border-bottom:1px solid rgba(48,54,61,.5)}
+tr:hover td{background:var(--panel2)}
+.mono{font-family:Consolas,monospace;font-size:12px}
+#log{background:#0a0d12;border:1px solid var(--border);border-radius:8px;padding:12px;
+height:180px;overflow-y:auto;font-family:Consolas,monospace;font-size:12px;color:var(--dim);white-space:pre-wrap}
+.tip{color:var(--dim);font-size:12px;margin-top:8px}
+</style>
+</head>
+<body>
+<div class="wrap">
+<header>
+  <h1>ImDeploy 本地模型部署器</h1>
+  <span class="badge" id="status">检测中</span>
+</header>
+
+<div class="card">
+  <h2>服务状态</h2>
+  <dl class="kv" id="statusKv"><dt>加载中…</dt><dd></dd></dl>
+</div>
+
+<div class="card">
+  <h2>模型库</h2>
+  <div class="row">
+    <button onclick="loadModels()">刷新列表</button>
+    <span class="tip" id="modelTip"></span>
+  </div>
+  <table>
+    <thead><tr><th>模型</th><th>系列</th><th>参数量</th><th>上下文</th><th>量化</th></tr></thead>
+    <tbody id="modelBody"><tr><td colspan="5" style="color:var(--dim)">暂无已下载模型</td></tr></tbody>
+  </table>
+</div>
+
+<div class="card">
+  <h2>请求测试</h2>
+  <div class="row">
+    <input id="q" placeholder="输入一句话测试…" value="你好，介绍一下你自己">
+    <button class="primary" onclick="ask()">发送</button>
+  </div>
+  <div id="log">就绪。先在设置里加载模型，然后在这里测试对话。</div>
+</div>
+
+<div class="card">
+  <h2>接口地址</h2>
+  <dl class="kv">
+    <dt>OpenAI 兼容</dt><dd class="mono" id="u1"></dd>
+    <dt>模型列表</dt><dd class="mono" id="u2"></dd>
+    <dt>多模型别名</dt><dd class="mono" id="u3"></dd>
+  </dl>
+</div>
+</div>
+
+<script>
+const base = location.origin;
+const $ = id => document.getElementById(id);
+
+function log(msg){
+  const el = $('log');
+  el.textContent = msg;
+  el.scrollTop = el.scrollHeight;
+}
+
+async function loadStatus(){
+  try{
+    const r = await fetch(base + '/api/status');
+    const d = await r.json();
+    $('status').textContent = '服务运行中';
+    $('status').className = 'badge';
+    const backends = (d.backends||[]).map(b=>b.name||b).join('、') || '未检测到';
+    const loaded = Object.keys(d.loaded_models||{});
+    $('statusKv').innerHTML =
+      '<dt>监听地址</dt><dd class="mono">' + d.host + ':' + d.port + '</dd>' +
+      '<dt>推理后端</dt><dd>' + backends + '</dd>' +
+      '<dt>已加载模型</dt><dd>' + (loaded.length ? loaded.join('、') : '无') + '</dd>';
+    $('u1').textContent = base + '/v1/chat/completions';
+    $('u2').textContent = base + '/v1/models';
+    $('u3').textContent = base + '/api/qwen  ' + base + '/api/llama';
+  }catch(e){
+    $('status').textContent = '服务异常';
+    $('status').className = 'badge off';
+    $('statusKv').innerHTML = '<dt>错误</dt><dd>' + e + '</dd>';
+  }
+}
+
+async function loadModels(){
+  try{
+    const r = await fetch(base + '/v1/models');
+    const d = await r.json();
+    const items = d.data || [];
+    if(!items.length){
+      $('modelBody').innerHTML = '<tr><td colspan="5" style="color:var(--dim)">暂无已下载模型，请把 GGUF 放进 models 目录</td></tr>';
+      $('modelTip').textContent = '';
+      return;
+    }
+    $('modelBody').innerHTML = items.map(m =>
+      '<tr><td>' + m.id + '</td><td>-</td><td>-</td><td>-</td><td>-</td></tr>').join('');
+    $('modelTip').textContent = '共 ' + items.length + ' 个';
+  }catch(e){
+    $('modelBody').innerHTML = '<tr><td colspan="5" style="color:var(--err)">加载失败：' + e + '</td></tr>';
+  }
+}
+
+async function ask(){
+  const q = $('q').value.trim();
+  if(!q) return;
+  log('请求中…');
+  try{
+    const r = await fetch(base + '/v1/chat/completions', {
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({model:'qwen', messages:[{role:'user',content:q}]})
+    });
+    const d = await r.json();
+    if(d.error){ log('错误：' + (d.error.message || JSON.stringify(d.error))); return; }
+    const txt = d.choices?.[0]?.message?.content || JSON.stringify(d);
+    log(txt);
+  }catch(e){ log('请求失败：' + e); }
+}
+
+loadStatus(); loadModels();
+setInterval(loadStatus, 5000);
+</script>
+</body>
+</html>
+"""
 
 
 # ---------------------------------------------------------------- 统计
@@ -322,8 +482,21 @@ def create_handler(server: ApiServer) -> type[BaseHTTPRequestHandler]:
             if path in ("/v1/models", "/api/models"):
                 self._handle_models()
                 return
+            if path in ("/", "/index.html", "/ui", "/docs"):
+                self._send_html(_WEBUI_HTML)
+                server.stats.count_request()
+                return
             self._send_error_json(f"未找到路径：{path}", "invalid_request_error", 404, "not_found")
             server.stats.count_request(failed=True)
+
+        def _send_html(self, html: str) -> None:
+            body = html.encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(body)
 
         def _handle_models(self) -> None:
             data: list[dict[str, Any]] = []

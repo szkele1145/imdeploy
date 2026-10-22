@@ -43,6 +43,8 @@ logger = logging.getLogger(__name__)
 
 USER_AGENT = "imdeploy/0.1 (local GGUF model recommender; python-urllib)"
 HF_MODELS_API = "https://huggingface.co/api/models"
+#: 国内可用的 HuggingFace 镜像，直连失败时自动回退
+HF_MIRROR_API = "https://hf-mirror.com/api/models"
 MODELSCOPE_MODELS_API = "https://modelscope.cn/api/v1/models"
 MODELSCOPE_FILES_API = "https://modelscope.cn/api/v1/models/{path}/repo/files"
 
@@ -453,14 +455,22 @@ def fetch_hf_models(
     timeout: float = DEFAULT_TIMEOUT,
     with_details: bool = True,
 ) -> list[ModelEntry]:
-    """搜索 HuggingFace 上的 GGUF 模型。失败返回空列表。"""
+    """搜索 HuggingFace 上的 GGUF 模型。失败时自动回退 hf-mirror；都失败返回空列表。"""
     params = urllib.parse.urlencode({"search": query, "limit": max(1, int(limit)), "full": "true"})
-    url = f"{HF_MODELS_API}?{params}"
-    try:
-        payload = _http_get_json(url, timeout)
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("HuggingFace 抓取失败（query=%s）: %s", query, exc)
+    payload: Any = None
+    used_mirror = False
+    for base in (HF_MODELS_API, HF_MIRROR_API):
+        url = f"{base}?{params}"
+        try:
+            payload = _http_get_json(url, timeout)
+            used_mirror = base == HF_MIRROR_API
+            break
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("模型目录抓取失败（%s / query=%s）: %s", base, query, exc)
+    if payload is None:
         return []
+    if used_mirror:
+        logger.info("已通过 hf-mirror 镜像获取目录（query=%s）", query)
     if not isinstance(payload, list):
         logger.warning("HuggingFace 返回格式异常（query=%s）", query)
         return []
@@ -797,7 +807,7 @@ def build_catalog(
     use_cache: bool = True,
     cache_path: str | Path | None = None,
     limit: int = DEFAULT_LIMIT,
-    sources: Sequence[str] = ("hf", "modelscope"),
+    sources: Sequence[str] = ("hf",),
     cache_ttl_hours: float = 24.0,
     timeout: float = DEFAULT_TIMEOUT,
 ) -> list[ModelEntry]:
@@ -825,21 +835,29 @@ def build_catalog(
         elif key in ("ms", "modelscope"):
             fetchers.append(fetch_modelscope_models)
 
-    collected: list[ModelEntry] = []
-    for query in query_list:
+    # 各查询词并发抓取（串行 8 个查询极易被用户当成"卡死"）
+    def _fetch_one(query: str) -> list[ModelEntry]:
+        out: list[ModelEntry] = []
         for fetcher in fetchers:
             try:
-                got = fetcher(query, limit)
+                out.extend(fetcher(query, limit) or [])
             except TypeError:
                 try:
-                    got = fetcher(query)
+                    out.extend(fetcher(query) or [])
                 except Exception as exc:  # noqa: BLE001
-                    logger.warning("抓取失败（%s / %s）: %s", getattr(fetcher, "__name__", fetcher), query, exc)
-                    continue
+                    logger.warning("抓取失败（%s / %s）: %s",
+                                   getattr(fetcher, "__name__", fetcher), query, exc)
             except Exception as exc:  # noqa: BLE001
-                logger.warning("抓取失败（%s / %s）: %s", getattr(fetcher, "__name__", fetcher), query, exc)
-                continue
-            collected.extend(got or [])
+                logger.warning("抓取失败（%s / %s）: %s",
+                               getattr(fetcher, "__name__", fetcher), query, exc)
+        return out
+
+    collected: list[ModelEntry] = []
+    if fetchers:
+        workers = min(6, max(1, len(query_list)))
+        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
+            for got in pool.map(_fetch_one, query_list):
+                collected.extend(got)
 
     merged = _dedupe(collected)
     try:

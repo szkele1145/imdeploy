@@ -64,8 +64,8 @@ def build_exe() -> Path:
         "--workpath", str(ROOT / "build" / "pyinstaller"),
         "--specpath", str(ROOT / "build"),
         "--distpath", str(ROOT / "dist"),
-        # 无控制台窗口：双击只出 GUI，不弹黑框
-        "--windowed",
+        # 命令行形态：启动后显示控制台日志（用户要求）
+        "--console",
     ]
     for h in HIDDEN:
         cmd += ["--hidden-import", h]

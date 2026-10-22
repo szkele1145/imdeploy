@@ -92,33 +92,16 @@ def to_bmp(px, size):
     return header + b"".join(rows)
 
 
-def write_ico(path: Path, sizes=(16, 24, 32, 48, 64, 128, 256)) -> Path:
-    images = []
-    for s in sizes:
-        px = render(s)
-        images.append((s, to_bmp(px, s)))
+def render_icon(size: int):
+    return render(size)
 
-    offset = 6 + 16 * len(images)
-    entries = []
-    blobs = []
-    for s, data in images:
-        entries.append(struct.pack("<BBBBHHII",
-                                   0 if s >= 256 else s,
-                                   0 if s >= 256 else s,
-                                   0, 0, 1, 32, len(data), offset))
-        blobs.append(data)
-        offset += len(data)
 
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "wb") as f:
-        f.write(struct.pack("<HHH", 0, 1, len(images)))
-        for e in entries:
-            f.write(e)
-        for b in blobs:
-            f.write(b)
-    return path
+def write_ico_public(path: Path, sizes=(16, 24, 32, 48, 64, 128, 256)) -> Path:
+    from icoutil import write_ico as _w
+
+    return _w(path, render, sizes)
 
 
 if __name__ == "__main__":
-    p = write_ico(OUT)
+    p = write_ico_public(OUT)
     print(f"已生成图标: {p}  ({p.stat().st_size} 字节)")

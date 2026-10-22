@@ -33,15 +33,30 @@ def _init_config(path: Path) -> int:
     return 0
 
 
-def _serve(cfg) -> int:
+def _serve(cfg, open_browser: bool = True) -> int:
+    import threading
+    import webbrowser
+
     from .api_server import build_server
 
     httpd, api = build_server(cfg)
+    url = f"http://{api.host}:{api.port}"
     try:
-        print(f"API 服务已启动: http://{api.host}:{api.port}")
-        print("OpenAI 兼容端点: /v1/chat/completions")
-        print("多模型别名端点: /api/qwen, /api/llama, /api/gemma ...")
-        print("Ctrl+C 退出")
+        print("=" * 56)
+        print("  ImDeploy 本地模型部署器")
+        print("=" * 56)
+        print(f"  服务地址：{url}")
+        print(f"  接口文档：{url}/docs")
+        print(f"  模型列表：{url}/v1/models")
+        print(f"  多模型：  {url}/api/qwen  {url}/api/llama  …")
+        print("=" * 56)
+        print("  按 Ctrl+C 退出")
+        print()
+        if open_browser:
+            try:
+                webbrowser.open(url)
+            except Exception:  # noqa: BLE001
+                pass
         httpd.serve_forever()
     except KeyboardInterrupt:
         print("\n正在退出…")
@@ -103,13 +118,8 @@ def main(argv: list[str] | None = None) -> int:
         return _serve(cfg)
 
     if not args.cli:
-        # 无参数 / GUI 模式
-        try:
-            from .gui import run_gui
-        except Exception as exc:  # noqa: BLE001
-            print(f"图形面板不可用（{exc}），回退到命令行模式")
-            return _serve(cfg)
-        return run_gui(config_path)
+        # 无参数：命令行形态 —— 起 API 服务并在控制台显示日志，自动打开 WebUI
+        return _serve(cfg)
 
     # CLI 模式：打印帮助
     parser.print_help()

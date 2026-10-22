@@ -468,29 +468,106 @@ def _gpu_linux_pci() -> tuple[str, float]:
 
 
 def _gpu_windows_fallback() -> tuple[str, float]:
-    """Windows 无 nvidia-smi 时：用 wmic 找显示适配器（显存信息通常为空）。"""
-    out = _run(["wmic", "path", "win32_VideoController", "get", "name,AdapterRAM"])
-    best_name = ""
-    best_vram = 0.0
-    for line in out.splitlines():
+    """Windows 无 nvidia-smi 时：用 PowerShell CIM 枚举显示适配器。
+
+    Win11 已移除 wmic，所以优先用 Get-CimInstance。要覆盖 AMD / Intel 独显与核显：
+    跳过虚拟显示器（GameViewer、Parsec、Basic Display 之类）。
+    """
+    candidates: list[tuple[str, float]] = []
+
+    ps = (
+        "Get-CimInstance Win32_VideoController | "
+        "ForEach-Object { \"$($_.Name)|$($_.AdapterRAM)|$($_.DriverVersion)\" }"
+    )
+    out = _run(["powershell", "-NoProfile", "-NonInteractive", "-Command", ps],
+               timeout=15.0)
+    if not out:
+        # 极旧系统兜底
+        out2 = _run(["wmic", "path", "win32_VideoController",
+                     "get", "name,AdapterRAM"], timeout=10.0)
+        if out2:
+            for line in out2.splitlines():
+                line = line.strip()
+                if not line or line.lower().startswith("name"):
+                    continue
+                parts = [p.strip() for p in line.split(",")]
+                name = parts[0] if parts else ""
+                vram = 0.0
+                if len(parts) > 1:
+                    try:
+                        vram = float(re.sub(r"[^\d.]", "", parts[1]) or 0) / _GB
+                    except ValueError:
+                        vram = 0.0
+                if name:
+                    candidates.append((name, vram))
+
+    for line in (out or "").splitlines():
         line = line.strip()
-        if not line or line.lower().startswith("name"):
+        if not line or "|" not in line:
             continue
-        parts = [p.strip() for p in line.split(",")]
-        if not parts:
-            continue
-        name = parts[0]
+        parts = line.split("|")
+        name = parts[0].strip()
         vram = 0.0
         if len(parts) > 1:
             try:
-                vram = float(re.sub(r"[^\d.]", "", parts[1]) or 0) / _GB
+                vram = float(parts[1] or 0) / _GB
             except ValueError:
                 vram = 0.0
-        if vram > best_vram:
-            best_vram, best_name = vram, name
-        elif not best_name:
-            best_name = name
+        if name:
+            candidates.append((name, vram))
+
+    best_name = ""
+    best_vram = 0.0
+    best_score = -999.0
+    for name, vram in candidates:
+        low = name.lower()
+        # 排除虚拟 / 基础显示适配器
+        if any(k in low for k in ("virtual", "basic display", "parsec",
+                                  "gameviewer", "idedisplay", "remote",
+                                  "spacedesk", "oray")):
+            continue
+        score = vram
+        if "nvidia" in low or "geforce" in low or "radeon rx" in low or "arc a" in low:
+            score += 100  # 认作独显，优先
+        elif "radeon" in low or "intel" in low or "uhd" in low or "iris" in low:
+            score += 10
+        if score > best_score:
+            best_score, best_name, best_vram = score, name, vram
+
     return best_name, best_vram
+
+
+def _vram_from_registry(name_hint: str = "") -> float:
+    """AMD / Intel 的 AdapterRAM 常被截断成 4GB，用注册表 HardwareInformation.qwMemorySize 补。"""
+    try:
+        import winreg  # type: ignore  # noqa: PLC0415
+    except ImportError:
+        return 0.0
+
+    base = r"SYSTEM\CurrentControlSet\Control\Class\{4d36e968-e325-11ce-bfc1-08002be10318}"
+    best = 0.0
+    try:
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, base) as root:
+            idx = 0
+            while True:
+                try:
+                    sub = winreg.EnumKey(root, idx)
+                except OSError:
+                    break
+                idx += 1
+                if not sub.isdigit():
+                    continue
+                try:
+                    with winreg.OpenKey(root, sub) as k:
+                        size, _ = winreg.QueryValueEx(k, "HardwareInformation.qwMemorySize")
+                        val = float(size)
+                        if val > best:
+                            best = val
+                except OSError:
+                    continue
+    except OSError:
+        return 0.0
+    return best / _GB if best else 0.0
 
 
 def _detect_gpu() -> tuple[str, float, str]:
@@ -548,6 +625,15 @@ def detect() -> HardwareInfo:
 
     if not cores:
         cores = os.cpu_count() or 0
+
+    # AMD / Intel 的 AdapterRAM 会被截断到 4GB，用注册表补真实显存
+    if gpu_name and system == "windows" and (gpu_vram <= 0 or gpu_vram >= 3.9):
+        try:
+            reg_vram = _vram_from_registry()
+            if reg_vram > gpu_vram:
+                gpu_vram = reg_vram
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("注册表显存读取失败: %s", exc)
 
     return HardwareInfo(
         cpu_arch=arch,
