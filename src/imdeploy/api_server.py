@@ -86,6 +86,23 @@ height:180px;overflow-y:auto;font-family:Consolas,monospace;font-size:12px;color
 </div>
 
 <div class="card">
+  <h2>推荐模型（按本机硬件匹配）</h2>
+  <div class="row">
+    <button class="primary" onclick="loadRecs(true)">重新推荐</button>
+    <span class="tip" id="recTip">点「重新推荐」从模型站抓取并匹配</span>
+  </div>
+  <table>
+    <thead><tr><th>模型</th><th>档位</th><th>参数量</th><th>上下文</th><th>体积</th><th>操作</th></tr></thead>
+    <tbody id="recBody"><tr><td colspan="6" style="color:var(--dim)">尚未加载推荐列表</td></tr></tbody>
+  </table>
+</div>
+
+<div class="card">
+  <h2>下载进度</h2>
+  <div id="dlBox"><span class="tip">暂无下载任务</span></div>
+</div>
+
+<div class="card">
   <h2>模型库</h2>
   <div class="row">
     <button onclick="loadModels()">刷新列表</button>
@@ -183,8 +200,73 @@ async function ask(){
   }catch(e){ log('请求失败：' + e); }
 }
 
-loadStatus(); loadModels();
+async function loadRecs(refresh){
+  $('recTip').textContent = refresh ? '正在抓取模型目录，可能需要十几秒…' : '加载中…';
+  try{
+    const r = await fetch(base + '/api/recommend?limit=20&refresh=' + (refresh ? 1 : 0));
+    const d = await r.json();
+    if(!d.ok){ $('recTip').textContent = '失败：' + (d.error?.message || '未知错误'); return; }
+    const ms = d.models || [];
+    if(!ms.length){
+      $('recBody').innerHTML = '<tr><td colspan="6" style="color:var(--dim)">没有匹配到模型</td></tr>';
+      $('recTip').textContent = '没有匹配到模型';
+      return;
+    }
+    $('recBody').innerHTML = ms.map(m => {
+      const tier = m.tier || '-';
+      const color = tier === '首选' ? 'var(--ok)' : tier === '备选' ? 'var(--accent)'
+                  : tier === '不适合' ? 'var(--err)' : 'var(--warn)';
+      const size = m.size_gb ? m.size_gb.toFixed(2) + ' GB' : '-';
+      const ctx = m.ctx_len ? Math.round(m.ctx_len/1024) + 'K' : '-';
+      const btn = '<button onclick="startDl(\'' + m.id.replace(/'/g,"\\'") + '\')">下载</button>';
+      return '<tr><td>' + m.name + '</td>'
+        + '<td style="color:' + color + '">' + tier + '</td>'
+        + '<td>' + (m.params_b ? m.params_b + 'B' : '-') + '</td>'
+        + '<td>' + ctx + '</td><td>' + size + '</td><td>' + btn + '</td></tr>';
+    }).join('');
+    $('recTip').textContent = '共 ' + ms.length + ' 个候选';
+  }catch(e){ $('recTip').textContent = '请求失败：' + e; }
+}
+
+async function startDl(mid){
+  try{
+    const r = await fetch(base + '/api/download', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({model_id: mid})
+    });
+    const d = await r.json();
+    if(!d.ok){ $('recTip').textContent = '下载失败：' + (d.error || ''); return; }
+    $('recTip').textContent = '已开始下载：' + mid;
+    pollDownloads();
+  }catch(e){ $('recTip').textContent = '请求失败：' + e; }
+}
+
+async function pollDownloads(){
+  try{
+    const r = await fetch(base + '/api/downloads');
+    const d = await r.json();
+    const tasks = Object.values(d.tasks || {});
+    if(!tasks.length){ $('dlBox').innerHTML = '<span class="tip">暂无下载任务</span>'; return; }
+    $('dlBox').innerHTML = tasks.map(t => {
+      const pct = t.percent || 0;
+      const color = t.status === 'done' ? 'var(--ok)'
+                  : t.status === 'error' ? 'var(--err)' : 'var(--accent)';
+      const bar = '<div style="background:var(--panel2);border-radius:4px;height:6px;margin-top:6px;overflow:hidden">'
+        + '<div style="width:' + pct + '%;height:100%;background:' + color + ';transition:width .3s"></div></div>';
+      const label = t.status === 'done' ? '已完成'
+                  : t.status === 'error' ? ('失败：' + (t.error||''))
+                  : (pct.toFixed(1) + '%');
+      var extra = '';
+      if(t.status === 'done') extra = ' <button onclick="loadModels()">刷新模型库</button>';
+      return '<div style="margin-bottom:10px"><b>' + t.model_id + '</b> '
+        + '<span style="color:' + color + '">' + label + '</span>' + extra + bar + '</div>';
+    }).join('');
+  }catch(e){}
+}
+
+loadStatus(); loadModels(); pollDownloads();
 setInterval(loadStatus, 5000);
+setInterval(pollDownloads, 2000);
 </script>
 </body>
 </html>
@@ -254,6 +336,12 @@ class ApiServer:
             str(k): str(v)
             for k, v in (self.cfg.get("api.aliases", {}) or {}).items()
         }
+
+        # 模型目录 / 推荐结果 / 下载任务 缓存
+        self._catalog_cache: list[Any] | None = None
+        self._rec_cache: list[Any] | None = None
+        self._hw_cache: Any = None
+        self._downloads: dict[str, dict[str, Any]] = {}
 
     # ---------------- 后端 ----------------
 
@@ -395,6 +483,112 @@ class ApiServer:
             }}
         return forward_json(base, path, payload, timeout=timeout)
 
+    # ---------------- 模型目录 / 推荐 / 下载 ----------------
+
+    def get_recommendations(self, limit: int = 20, min_ctx: int = 4096,
+                            refresh: bool = False) -> list[dict[str, Any]]:
+        """返回按本机硬件排序的推荐模型。结果缓存，避免每次重复抓取。"""
+        from .catalog import build_catalog
+        from .hardware import detect
+        from .recommend import recommend
+
+        with self._lock:
+            cat = self._catalog_cache
+            recs = self._rec_cache
+
+        if refresh or cat is None:
+            try:
+                cat = build_catalog(use_cache=not refresh)
+            except Exception as exc:  # noqa: BLE001
+                raise RuntimeError(f"抓取模型目录失败：{exc}") from exc
+            with self._lock:
+                self._catalog_cache = cat
+
+        hw = self._hw_cache
+        if hw is None:
+            hw = detect()
+            with self._lock:
+                self._hw_cache = hw
+
+        recs = recommend(cat, hw, limit=limit, min_ctx=min_ctx)
+        with self._lock:
+            self._rec_cache = recs
+
+        out: list[dict[str, Any]] = []
+        for r in recs:
+            e = r.entry
+            out.append({
+                "id": e.id,
+                "name": e.name,
+                "family": e.family,
+                "params_b": e.params_b,
+                "quant": e.quant,
+                "ctx_len": e.ctx_len,
+                "size_gb": r.estimated_size_gb or e.size_gb,
+                "tier": r.tier,
+                "score": r.score,
+                "fit": r.fit,
+                "reasons": r.reasons,
+                "download_url": e.download_url,
+                "repo_url": e.repo_url,
+            })
+        return out
+
+    def start_download(self, model_id: str) -> dict[str, Any]:
+        """后台下载一个模型（按 model_id 从缓存目录里找下载地址）。"""
+        from .downloader import Downloader
+
+        with self._lock:
+            if model_id in self._downloads and self._downloads[model_id].get("status") == "downloading":
+                return {"ok": False, "error": "该模型正在下载中", "model_id": model_id}
+
+        url = ""
+        size_hint = 0.0
+        with self._lock:
+            for r in (self._rec_cache or []):
+                if r.entry.id == model_id:
+                    url = r.entry.download_url
+                    size_hint = r.estimated_size_gb
+                    break
+        if not url:
+            return {"ok": False, "error": f"找不到模型的下载地址：{model_id}"}
+
+        dest = self.cfg.models_dir / f"{model_id.replace('/', '_')}.gguf"
+        state: dict[str, Any] = {
+            "model_id": model_id, "status": "downloading", "percent": 0.0,
+            "downloaded": 0, "total": 0, "error": "",
+            "dest": str(dest), "size_hint_gb": size_hint,
+        }
+        with self._lock:
+            self._downloads[model_id] = state
+
+        def worker() -> None:
+            dl = Downloader()
+
+            def progress(task) -> None:
+                with self._lock:
+                    state["percent"] = round(task.percent, 1)
+                    state["downloaded"] = task.downloaded
+                    state["total"] = task.size
+
+            try:
+                task = dl.download(url, dest, progress=progress)
+                with self._lock:
+                    state["status"] = "done" if task.status == "done" else "error"
+                    state["error"] = task.error or ""
+                    state["percent"] = 100.0 if task.status == "done" else state["percent"]
+            except Exception as exc:  # noqa: BLE001
+                with self._lock:
+                    state["status"] = "error"
+                    state["error"] = str(exc)
+
+        threading.Thread(target=worker, daemon=True).start()
+        return {"ok": True, "model_id": model_id, "dest": str(dest)}
+
+    def download_status(self) -> dict[str, Any]:
+        with self._lock:
+            return {k: dict(v) for k, v in self._downloads.items()}
+
 
 # ---------------------------------------------------------------- Handler
 
@@ -482,6 +676,24 @@ def create_handler(server: ApiServer) -> type[BaseHTTPRequestHandler]:
             if path in ("/v1/models", "/api/models"):
                 self._handle_models()
                 return
+            if path in ("/api/recommend", "/api/catalog"):
+                q = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
+                try:
+                    limit = int((q.get("limit") or ["20"])[0])
+                    min_ctx = int((q.get("min_ctx") or ["4096"])[0])
+                    refresh = (q.get("refresh") or ["0"])[0] in ("1", "true", "yes")
+                    data = server.get_recommendations(limit=limit, min_ctx=min_ctx,
+                                                      refresh=refresh)
+                except Exception as exc:  # noqa: BLE001
+                    self._send_error_json(f"获取推荐失败：{exc}", "api_error", 500, "recommend_failed")
+                    return
+                self._send_json({"ok": True, "count": len(data), "models": data})
+                server.stats.count_request()
+                return
+            if path == "/api/downloads":
+                self._send_json({"ok": True, "tasks": server.download_status()})
+                server.stats.count_request()
+                return
             if path in ("/", "/index.html", "/ui", "/docs"):
                 self._send_html(_WEBUI_HTML)
                 server.stats.count_request()
@@ -555,6 +767,15 @@ def create_handler(server: ApiServer) -> type[BaseHTTPRequestHandler]:
                 self._handle_completion(payload)
             elif path == "/api/embeddings" or path == "/v1/embeddings":
                 self._handle_embeddings(payload)
+            elif path == "/api/download":
+                mid = str(payload.get("model_id") or payload.get("id") or "").strip()
+                if not mid:
+                    server.stats.count_request(failed=True)
+                    self._send_error_json("缺少 model_id", "invalid_request_error", 400, "missing_model_id")
+                    return
+                res = server.start_download(mid)
+                self._send_json(res, 200 if res.get("ok") else 400)
+                server.stats.count_request(failed=not res.get("ok"))
             elif path.startswith("/api/") and len(path) > 5:
                 self._handle_alias(path[len("/api/"):], payload)
             else:

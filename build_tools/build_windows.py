@@ -86,6 +86,16 @@ def build_exe() -> Path:
     # 附带默认目录
     for sub in ("data", "models", "logs"):
         (exe.parent / sub).mkdir(exist_ok=True)
+
+    # 关键：把 app.ico 复制到 exe 同级目录。
+    # 安装脚本的快捷方式引用 {app}\app.ico，文件不在的话图标就是白块。
+    icon_src = ROOT / "build_tools" / "app.ico"
+    if icon_src.exists():
+        shutil.copy2(icon_src, exe.parent / "app.ico")
+        print(f"[图标] 已复制到 {exe.parent / 'app.ico'}")
+    else:
+        print("[警告] app.ico 不存在，快捷方式将没有图标")
+
     return exe
 
 

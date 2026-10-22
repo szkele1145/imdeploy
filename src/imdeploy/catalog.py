@@ -47,21 +47,24 @@ HF_MODELS_API = "https://huggingface.co/api/models"
 HF_MIRROR_API = "https://hf-mirror.com/api/models"
 MODELSCOPE_MODELS_API = "https://modelscope.cn/api/v1/models"
 MODELSCOPE_FILES_API = "https://modelscope.cn/api/v1/models/{path}/repo/files"
+#: 镜像的下载前缀（resolve 路径）
+HF_MIRROR_DL = "https://hf-mirror.com"
 
 DEFAULT_TIMEOUT = 20.0
 DEFAULT_LIMIT = 20
 DEFAULT_DETAIL_WORKERS = 6
 
-#: 默认查询词（覆盖主流小模型家族）
+#: 默认查询词（覆盖主流小模型家族 + 长上下文优化版）
 DEFAULT_QUERIES: tuple[str, ...] = (
-    "gguf qwen3",
-    "gguf qwen2.5",
-    "gguf llama",
-    "gguf gemma",
-    "gguf smollm",
-    "gguf phi",
-    "gguf internlm",
-    "gguf minicpm",
+    "Qwen2.5 GGUF",
+    "Qwen3 GGUF",
+    "Llama-3.2 GGUF",
+    "SmolLM2 GGUF",
+    "gemma-2 GGUF",
+    "Phi-3.5 GGUF",
+    "MiniCPM GGUF",
+    "TinyLlama GGUF",
+    "InternLM2 GGUF",
 )
 
 #: 默认缓存位置：<项目根>/data/catalog.json（相对包路径推导，不写死绝对路径）
@@ -419,7 +422,8 @@ def parse_hf_model(obj: dict[str, Any]) -> ModelEntry | None:
     display_name = str(card.get("pretty_name") or repo_id.split("/")[-1])
     params_b = _hf_params_b(obj, files, quant, size_gb)
     ctx_len = _hf_ctx_len(obj, files)
-    download_url = f"https://huggingface.co/{_quote(repo_id)}/resolve/main/{_quote(chosen.name)}"
+    # 下载地址走镜像（国内 huggingface.co 直连基本不通）
+    download_url = f"{HF_MIRROR_DL}/{_quote(repo_id)}/resolve/main/{_quote(chosen.name)}"
     return ModelEntry(
         id=repo_id,
         name=display_name,
@@ -440,13 +444,15 @@ def parse_hf_model(obj: dict[str, Any]) -> ModelEntry | None:
 
 def _hf_detail(model_id: str, timeout: float = DEFAULT_TIMEOUT) -> dict[str, Any]:
     """拉取单个模型的完整信息（带文件体积）。失败返回空 dict。"""
-    url = f"{HF_MODELS_API}/{_quote(model_id)}?blobs=true"
-    try:
-        payload = _http_get_json(url, timeout)
-    except Exception as exc:  # noqa: BLE001 - 网络异常统一降级
-        logger.debug("HF 详情抓取失败 %s: %s", model_id, exc)
-        return {}
-    return payload if isinstance(payload, dict) else {}
+    for base in (HF_MIRROR_API, HF_MODELS_API):
+        url = f"{base}/{_quote(model_id)}?blobs=true"
+        try:
+            payload = _http_get_json(url, timeout)
+            if isinstance(payload, dict):
+                return payload
+        except Exception as exc:  # noqa: BLE001 - 网络异常统一降级
+            logger.debug("HF 详情抓取失败 %s: %s", model_id, exc)
+    return {}
 
 
 def fetch_hf_models(
@@ -459,7 +465,8 @@ def fetch_hf_models(
     params = urllib.parse.urlencode({"search": query, "limit": max(1, int(limit)), "full": "true"})
     payload: Any = None
     used_mirror = False
-    for base in (HF_MODELS_API, HF_MIRROR_API):
+    # 镜像优先：国内直连 huggingface.co 经常超时（实测 60s+）
+    for base in (HF_MIRROR_API, HF_MODELS_API):
         url = f"{base}?{params}"
         try:
             payload = _http_get_json(url, timeout)
