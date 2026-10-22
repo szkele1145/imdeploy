@@ -1,0 +1,45 @@
+plugins {
+    id 'com.android.application'
+}
+
+android {
+    namespace 'com.imdeploy.app'
+    compileSdk 35
+
+    defaultConfig {
+        applicationId "com.imdeploy.app"
+        // Android 10 (API 29) ~ Android 16 (API 36)
+        minSdk 29
+        targetSdk 35
+        versionCode 1
+        versionName "0.1.0"
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_1_8
+        targetCompatibility JavaVersion.VERSION_1_8
+    }
+
+    // 签名：用仓库里的 keystore，保证 CI 与本地产出的 APK 都能安装
+    signingConfigs {
+        release {
+            storeFile file("../keystore/debug.keystore")
+            storePassword "android"
+            keyAlias "androiddebugkey"
+            keyPassword "android"
+        }
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled false
+            signingConfig signingConfigs.release
+        }
+    }
+
+    sourceSets {
+        main {
+            assets.srcDirs = ['src/main/assets']
+        }
+    }
+}
