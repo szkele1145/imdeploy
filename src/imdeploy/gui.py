@@ -75,9 +75,34 @@ class ControlPanelGUI:
         self.root.geometry("900x680")
         self.root.minsize(820, 600)
         self.root.configure(bg=BG)
+        self._set_icon()
         self._style()
         self._build()
         self._poll()
+
+    def _set_icon(self) -> None:
+        """设置窗口图标（打包后从 _internal 里找 app.ico）。"""
+        import os
+        import sys
+
+        cands = []
+        base = getattr(sys, "_MEIPASS", None)
+        if base:
+            cands += [Path(base) / "app.ico", Path(base) / "build_tools" / "app.ico"]
+        here = Path(__file__).resolve()
+        cands += [
+            here.parents[2] / "build_tools" / "app.ico",
+            Path(os.getcwd()) / "build_tools" / "app.ico",
+            Path(os.getcwd()) / "app.ico",
+        ]
+        for c in cands:
+            try:
+                if c.is_file():
+                    self.root.iconbitmap(default=str(c))
+                    self._icon_path = c
+                    return
+            except Exception:  # noqa: BLE001
+                continue
 
     # ------------------------------------------------------------ 样式
 
@@ -282,8 +307,22 @@ class ControlPanelGUI:
                  f"请求口令：{'已设置' if self.cfg.get('app.token') else '未设置（不校验）'}"
         )
         if self.hardware:
-            from .hardware import summarize_hw  # type: ignore  # noqa: PLC0415
-            self.ov_hw.config(text=summarize_hw(self.hardware))
+            try:
+                from .hardware import summarize  # noqa: PLC0415
+
+                self.ov_hw.config(text=summarize(self.hardware), fg=TEXT)
+            except Exception:  # noqa: BLE001
+                hw = self.hardware
+                self.ov_hw.config(
+                    text=f"CPU：{hw.cpu_model_name or hw.cpu_arch}（{hw.cpu_cores} 核）\n"
+                         f"内存：{hw.total_ram_gb:.1f} GB（可用 {hw.available_ram_gb:.1f} GB）\n"
+                         f"显卡：{hw.gpu_name or '未检测到独显'}"
+                         + (f"（{hw.gpu_vram_gb:.1f} GB 显存）" if hw.gpu_vram_gb else ""),
+                    fg=TEXT)
+        elif getattr(self, "_hw_done", False):
+            self.ov_hw.config(text="未能检测到硬件信息（可点「重新检测硬件」重试）", fg=WARN)
+        else:
+            self.ov_hw.config(text="正在检测本机硬件…", fg=DIM)
         self.ov_api.config(
             text=f"OpenAI 兼容：{base}/v1/chat/completions\n"
                  f"模型列表：{base}/v1/models\n"
@@ -734,6 +773,10 @@ class ControlPanelGUI:
             if not getattr(self, "_runtime_checked", False):
                 self._runtime_checked = True
                 self._refresh_runtime()
+            if not getattr(self, "_hw_started", False):
+                # 启动后立刻在后台检测硬件，别让概览页一直显示"检测中…"
+                self._hw_started = True
+                self._detect_hw()
         except Exception:  # noqa: BLE001
             pass
         self.root.after(1500, self._poll)
@@ -788,6 +831,15 @@ class ControlPanelGUI:
                 self.btn_install_runtime.config(state="normal")
                 self.ov_runtime.config(text=str(payload), fg=ERR)
                 self._toast(str(payload))
+            elif kind == "hw":
+                self._hw_running = False
+                self._hw_done = True
+                self.hardware = payload
+                self._refresh_overview()
+            elif kind == "hw_error":
+                self._hw_running = False
+                self._hw_done = True
+                self.ov_hw.config(text=str(payload), fg=ERR)
 
     def _fill_rec_tree(self, recs) -> None:
         for item in self.rec_tree.get_children():
@@ -815,13 +867,19 @@ class ControlPanelGUI:
     # ------------------------------------------------------------ 杂项
 
     def _detect_hw(self) -> None:
+        if getattr(self, "_hw_running", False):
+            return
+        self._hw_running = True
+        self.ov_hw.config(text="正在检测本机硬件…", fg=DIM)
+
         def worker():
             try:
-                from .hardware import detect  # type: ignore  # noqa: PLC0415
-                self.hardware = detect()
-                self.tasks.put("hw", self.hardware)
+                from .hardware import detect  # noqa: PLC0415
+
+                hw = detect()
+                self.tasks.put("hw", hw)
             except Exception as exc:  # noqa: BLE001
-                self.tasks.put("error", f"硬件检测失败: {exc}")
+                self.tasks.put("hw_error", f"硬件检测失败：{exc}")
 
         threading.Thread(target=worker, daemon=True).start()
 

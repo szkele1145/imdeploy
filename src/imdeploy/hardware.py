@@ -13,6 +13,7 @@ import platform
 import re
 import shutil
 import subprocess
+import sys
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -68,7 +69,18 @@ class HardwareInfo:
 # 工具
 # --------------------------------------------------------------------------- #
 def _run(cmd: list[str], timeout: float = 6.0) -> str:
-    """执行命令并返回 stdout；失败返回空串。"""
+    """执行命令并返回 stdout；失败返回空串。
+
+    关键是 ``CREATE_NO_WINDOW``：否则每调一次 powershell / nvidia-smi
+    都会闪一个黑窗口出来，用户会看到一堆莫名其妙的控制台。
+    """
+    kwargs: dict[str, Any] = {}
+    if sys.platform.startswith("win"):
+        kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+        startupinfo = subprocess.STARTUPINFO()
+        startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        startupinfo.wShowWindow = subprocess.SW_HIDE
+        kwargs["startupinfo"] = startupinfo
     try:
         completed = subprocess.run(
             cmd,
@@ -78,6 +90,7 @@ def _run(cmd: list[str], timeout: float = 6.0) -> str:
             check=False,
             encoding="utf-8",
             errors="replace",
+            **kwargs,
         )
     except (OSError, subprocess.SubprocessError) as exc:
         logger.debug("命令执行失败 %s: %s", cmd, exc)

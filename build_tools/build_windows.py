@@ -44,6 +44,17 @@ def build_exe() -> Path:
             raise SystemExit("未找到 pyinstaller，请先 pip install pyinstaller")
 
     entry = ROOT / "build_tools" / "entry.py"
+    icon = ROOT / "build_tools" / "app.ico"
+    if not icon.exists():
+        try:
+            sys.path.insert(0, str(ROOT / "build_tools"))
+            from make_icon import write_ico  # noqa: PLC0415
+
+            write_ico(icon)
+            print(f"[图标] 已生成 {icon}")
+        except Exception as exc:  # noqa: BLE001
+            print(f"[提示] 图标生成失败：{exc}")
+
     cmd = [
         pyinstaller,
         "--noconfirm", "--clean",
@@ -53,10 +64,14 @@ def build_exe() -> Path:
         "--workpath", str(ROOT / "build" / "pyinstaller"),
         "--specpath", str(ROOT / "build"),
         "--distpath", str(ROOT / "dist"),
-        "--console",
+        # 无控制台窗口：双击只出 GUI，不弹黑框
+        "--windowed",
     ]
     for h in HIDDEN:
         cmd += ["--hidden-import", h]
+    if icon.exists():
+        cmd += ["--icon", str(icon)]
+        cmd += ["--add-data", f"{icon}{os.pathsep}."]
     cmd.append(str(entry))
 
     print("执行:", " ".join(cmd))
@@ -98,6 +113,7 @@ WizardStyle=modern
 PrivilegesRequired=lowest
 PrivilegesRequiredOverridesAllowed=dialog
 ; 安装界面语言：简体中文
+SetupIconFile=@ICON@
 UninstallDisplayName={#MyAppName}
 UninstallDisplayIcon={app}\{#MyAppExeName}
 VersionInfoDescription=ImDeploy 本地模型部署器 安装程序
@@ -120,9 +136,9 @@ Name: "{app}\data"; Permissions: users-modify
 Name: "{app}\logs"; Permissions: users-modify
 
 [Icons]
-Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"
+Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; IconFilename: "{app}\app.ico"
 Name: "{group}\卸载 {#MyAppName}"; Filename: "{uninstallexe}"
-Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Tasks: desktopicon
+Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; IconFilename: "{app}\app.ico"; Tasks: desktopicon
 
 [Run]
 Filename: "{app}\{#MyAppExeName}"; Description: "立即启动 {#MyAppName}"; Flags: nowait postinstall skipifsilent
@@ -159,12 +175,14 @@ def build_installer(exe: Path) -> Path | None:
     out_dir.mkdir(parents=True, exist_ok=True)
 
     iss_path = ROOT / "build_tools" / "installer.iss"
-    iss_path.write_text(
-        ISS.replace("@VERSION@", VERSION)
-           .replace("@OUTDIR@", str(out_dir))
-           .replace("@SRC@", str(exe.parent)),
-        encoding="utf-8-sig",
-    )
+    icon = ROOT / "build_tools" / "app.ico"
+    text = (ISS.replace("@VERSION@", VERSION)
+               .replace("@OUTDIR@", str(out_dir))
+               .replace("@SRC@", str(exe.parent))
+               .replace("@ICON@", str(icon) if icon.exists() else ""))
+    if not icon.exists():
+        text = text.replace("SetupIconFile=\n", "")
+    iss_path.write_text(text, encoding="utf-8-sig")
 
     rc = subprocess.run([str(iscc), str(iss_path)], cwd=str(ROOT))
     if rc.returncode != 0:
