@@ -217,6 +217,7 @@ class LlamaCppBackend(Backend):
         here = Path(__file__).resolve().parent
         roots = [self.cfg.base_dir, here, here.parent, here.parent / "bin"]
         roots += [self.cfg.base_dir / "bin", self.cfg.base_dir / "tools",
+                  self.cfg.base_dir / "bin" / "llama",
                   self.cfg.base_dir / "llama.cpp" / "build" / "bin"]
         for root in roots:
             try:

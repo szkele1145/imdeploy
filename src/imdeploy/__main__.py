@@ -59,6 +59,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--init", action="store_true", help="生成配置模板后退出")
     parser.add_argument("--serve", action="store_true", help="只启动 API 服务（无 GUI）")
     parser.add_argument("--cli", action="store_true", help="命令行模式（不弹 GUI）")
+    parser.add_argument("--install-runtime", action="store_true",
+                        help="自动下载并安装 llama.cpp 运行库")
     parser.add_argument("--version", action="store_true", help="显示版本")
     args, unknown = parser.parse_known_args(raw)
 
@@ -74,6 +76,28 @@ def main(argv: list[str] | None = None) -> int:
     from .config import Config
 
     cfg = Config.load(config_path)
+
+    if args.install_runtime:
+        from .runtime_install import install_llama_runtime  # noqa: PLC0415
+
+        print("正在安装 llama.cpp 运行库…")
+        proxy = str(cfg.get("app.proxy", "") or "") or None
+
+        def on_progress(done: int, total: int) -> None:
+            if total > 0:
+                print(f"\r  下载中 {done * 100.0 / total:5.1f}%", end="", flush=True)
+
+        info = install_llama_runtime(cfg.base_dir / "bin", proxy=proxy,
+                                     progress=on_progress, log=print)
+        print()
+        if info.ok:
+            cfg.set("backend.llama_server", info.exe_path)
+            cfg.save(config_path)
+            print(f"[完成] {info.message}")
+            print(f"       路径：{info.exe_path}")
+            return 0
+        print(f"[失败] {info.message}")
+        return 1
 
     if args.serve:
         return _serve(cfg)

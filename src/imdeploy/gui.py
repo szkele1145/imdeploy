@@ -199,6 +199,76 @@ class ControlPanelGUI:
         ttk.Button(row, text="刷新状态", command=self._refresh_overview).pack(side="left", padx=8)
         ttk.Button(row, text="复制调用示例", command=self._copy_example).pack(side="left")
 
+        # 推理运行库（llama.cpp）—— 懒人版一键安装
+        tk.Label(wrap, text="推理运行库", bg=BG, fg=ACCENT,
+                 font=("Microsoft YaHei UI", 11, "bold")).pack(anchor="w", pady=(14, 0))
+        self.ov_runtime = tk.Label(wrap, text="检测中…", bg=BG, fg=DIM, justify="left",
+                                   anchor="w", font=("Microsoft YaHei UI", 10))
+        self.ov_runtime.pack(anchor="w", pady=(4, 6))
+
+        rrow = tk.Frame(wrap, bg=BG)
+        rrow.pack(fill="x")
+        self.btn_install_runtime = ttk.Button(
+            rrow, text="一键安装推理运行库", style="Accent.TButton",
+            command=self._install_runtime)
+        self.btn_install_runtime.pack(side="left")
+        ttk.Button(rrow, text="重新检测", command=self._refresh_runtime).pack(side="left", padx=8)
+
+    def _refresh_runtime(self) -> None:
+        """刷新 llama-server 检测状态。"""
+        try:
+            from .backends import detect_backends  # noqa: PLC0415
+
+            backends = detect_backends(self.cfg)
+            llama = next((b for b in backends if getattr(b, "name", "") == "llama.cpp"), None)
+            if llama is not None and llama.is_available():
+                path = getattr(llama, "server_path", "") or ""
+                self.ov_runtime.config(text=f"已就绪：{path}", fg=OK)
+                self.btn_install_runtime.config(text="重新安装运行库")
+            else:
+                self.ov_runtime.config(
+                    text="未安装 —— 点右边按钮自动下载安装，无需手动配置 PATH", fg=WARN)
+                self.btn_install_runtime.config(text="一键安装推理运行库")
+        except Exception as exc:  # noqa: BLE001
+            self.ov_runtime.config(text=f"检测失败：{exc}", fg=ERR)
+
+    def _install_runtime(self) -> None:
+        if getattr(self, "_installing", False):
+            self._toast("正在安装中，请稍候…")
+            return
+        self._installing = True
+        self.btn_install_runtime.config(state="disabled", text="正在安装…")
+        self.ov_runtime.config(text="正在查询最新版本…", fg=DIM)
+        threading.Thread(target=self._install_runtime_worker, daemon=True).start()
+
+    def _install_runtime_worker(self) -> None:
+        try:
+            from .runtime_install import install_llama_runtime  # noqa: PLC0415
+
+            proxy = str(self.cfg.get("app.proxy", "") or "") or None
+
+            def on_progress(done: int, total: int) -> None:
+                if total > 0:
+                    pct = done * 100.0 / total
+                    self.tasks.put("runtime_progress",
+                                   f"下载中 {pct:.0f}%（{done / 1048576:.1f}/"
+                                   f"{total / 1048576:.1f} MB）")
+                else:
+                    self.tasks.put("runtime_progress", f"下载中 {done / 1048576:.1f} MB")
+
+            def on_log(msg: str) -> None:
+                self.tasks.put("runtime_progress", msg)
+
+            info = install_llama_runtime(
+                self.cfg.base_dir / "bin",
+                proxy=proxy,
+                progress=on_progress,
+                log=on_log,
+            )
+            self.tasks.put("runtime_done", info)
+        except Exception as exc:  # noqa: BLE001
+            self.tasks.put("runtime_error", f"安装出错：{exc}")
+
     def _refresh_overview(self) -> None:
         host = str(self.cfg.get("app.host", "127.0.0.1"))
         port = int(self.cfg.get("app.port", 8080))
@@ -661,6 +731,9 @@ class ControlPanelGUI:
         try:
             self._handle_tasks()
             self._refresh_overview()
+            if not getattr(self, "_runtime_checked", False):
+                self._runtime_checked = True
+                self._refresh_runtime()
         except Exception:  # noqa: BLE001
             pass
         self.root.after(1500, self._poll)
@@ -693,6 +766,27 @@ class ControlPanelGUI:
                 self._toast("模型已停止")
             elif kind == "error":
                 self.lbl_rec_status.config(text=str(payload))
+                self._toast(str(payload))
+            elif kind == "runtime_progress":
+                self.ov_runtime.config(text=str(payload), fg=DIM)
+            elif kind == "runtime_done":
+                info = payload
+                self._installing = False
+                self.btn_install_runtime.config(state="normal")
+                if info.ok:
+                    self.cfg.set("backend.llama_server", info.exe_path)
+                    self.cfg.save(self.config_path)
+                    self.ov_runtime.config(
+                        text=f"已就绪：{info.exe_path}", fg=OK)
+                    self.btn_install_runtime.config(text="重新安装运行库")
+                    self._toast(info.message)
+                else:
+                    self.ov_runtime.config(text=info.message, fg=ERR)
+                    self._toast(info.message)
+            elif kind == "runtime_error":
+                self._installing = False
+                self.btn_install_runtime.config(state="normal")
+                self.ov_runtime.config(text=str(payload), fg=ERR)
                 self._toast(str(payload))
 
     def _fill_rec_tree(self, recs) -> None:
