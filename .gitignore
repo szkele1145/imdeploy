@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+build/
+dist/
+
+# 运行期数据
+data/
+models/
+logs/
+*.gguf
+*.part
+
+# 测试与工具
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+htmlcov/
+.coverage
+
+# 系统
+.DS_Store
+Thumbs.db
