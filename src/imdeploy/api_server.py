@@ -76,6 +76,7 @@ background:var(--dim);top:2px;left:2px;transition:.2s}
 .sw input:checked + .track{background:rgba(88,166,255,.25);border-color:var(--accent)}
 .sw input:checked + .track::after{left:20px;background:var(--accent)}
 h3{font-weight:600}
+.qsel{max-width:170px}
 table{width:100%;border-collapse:collapse;font-size:13px}
 th{text-align:left;padding:8px 10px;color:var(--dim);font-weight:500;border-bottom:1px solid var(--border);font-size:12px}
 td{padding:8px 10px;border-bottom:1px solid rgba(48,54,61,.5)}
@@ -360,11 +361,23 @@ async function loadRecs(refresh){
                   : tier === '不适合' ? 'var(--err)' : 'var(--warn)';
       const size = m.size_gb ? m.size_gb.toFixed(2) + ' GB' : '-';
       const ctx = m.ctx_len ? Math.round(m.ctx_len/1024) + 'K' : '-';
-      const btn = '<button onclick="startDl(\'' + m.id.replace(/'/g,"\\'") + '\')">下载</button>';
+      // 量化版本下拉：同一模型可能有 Q4_K_M / Q5_K_M / Q8_0 多份
+      const vars = m.variants || [];
+      let picker = '<button onclick="startDl(\'' + m.id.replace(/'/g,"\\'") + '\')">下载</button>';
+      if(vars.length > 1){
+        const opts = vars.map(v =>
+          '<option value="' + v.quant + '"'
+          + (v.quant === m.quant ? ' selected' : '') + '>'
+          + v.quant + (v.size_gb ? ' (' + v.size_gb.toFixed(1) + 'G)' : '')
+          + '</option>').join('');
+        picker = '<select class="qsel" id="q_' + m.id.replace(/[^a-zA-Z0-9]/g,"_") + '">'
+          + opts + '</select>'
+          + '<button onclick="startDl2(\'' + m.id.replace(/'/g,"\\'") + '\')">下载</button>';
+      }
       return '<tr><td>' + m.name + '</td>'
         + '<td style="color:' + color + '">' + tier + '</td>'
         + '<td>' + (m.params_b ? m.params_b + 'B' : '-') + '</td>'
-        + '<td>' + ctx + '</td><td>' + size + '</td><td>' + btn + '</td></tr>';
+        + '<td>' + ctx + '</td><td>' + size + '</td><td>' + picker + '</td></tr>';
     }).join('');
     $('recTip').textContent = '共 ' + ms.length + ' 个候选';
   }catch(e){ $('recTip').textContent = '请求失败：' + e; }
@@ -379,6 +392,23 @@ async function startDl(mid){
     const d = await r.json();
     if(!d.ok){ $('recTip').textContent = '下载失败：' + (d.error || ''); return; }
     $('recTip').textContent = '已开始下载：' + mid;
+    pollDownloads();
+  }catch(e){ $('recTip').textContent = '请求失败：' + e; }
+}
+
+// 带量化版本下载
+async function startDl2(mid){
+  const sel = document.getElementById('q_' + mid.replace(/[^a-zA-Z0-9]/g,"_"));
+  const quant = sel ? sel.value : '';
+  $('recTip').textContent = '开始下载 ' + mid + ' (' + (quant || '默认') + ')…';
+  try{
+    const r = await fetch(base + '/api/download', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({model_id: mid, quant: quant})
+    });
+    const d = await r.json();
+    if(!d.ok){ $('recTip').textContent = '下载失败：' + (d.error || ''); return; }
+    $('recTip').textContent = '已开始下载：' + mid + ' (' + (quant || '默认') + ')';
     pollDownloads();
   }catch(e){ $('recTip').textContent = '请求失败：' + e; }
 }
@@ -656,6 +686,24 @@ class ApiServer:
         with self._lock:
             self._rec_cache = recs
 
+        # 同一仓库的多个量化版本聚合成 variants，让前端能一次看清体积差异
+        try:
+            from .catalog import group_by_model  # noqa: PLC0415
+
+            variants_map = {g["id"]: g["variants"] for g in group_by_model(cat)}
+        except Exception:  # noqa: BLE001
+            variants_map = {}
+
+        # 把变体挂到 entry.meta 上，下载时才能按量化挑具体文件
+        with self._lock:
+            for r in (self._rec_cache or []):
+                vs = variants_map.get(r.entry.id)
+                if vs:
+                    try:
+                        r.entry.meta["variants"] = vs
+                    except Exception:  # noqa: BLE001
+                        pass
+
         out: list[dict[str, Any]] = []
         for r in recs:
             e = r.entry
@@ -673,36 +721,54 @@ class ApiServer:
                 "reasons": r.reasons,
                 "download_url": e.download_url,
                 "repo_url": e.repo_url,
+                "variants": variants_map.get(e.id, []),
             })
         return out
 
-    def start_download(self, model_id: str) -> dict[str, Any]:
-        """后台下载一个模型（按 model_id 从缓存目录里找下载地址）。"""
+    def start_download(self, model_id: str, quant: str = "") -> dict[str, Any]:
+        """后台下载一个模型。
+
+        ``quant`` 可指定量化版本（如 Q5_K_M）；留空则用推荐版本。
+        """
         from .downloader import Downloader
 
+        key = f"{model_id}::{quant}" if quant else model_id
         with self._lock:
-            if model_id in self._downloads and self._downloads[model_id].get("status") == "downloading":
+            if key in self._downloads and self._downloads[key].get("status") == "downloading":
                 return {"ok": False, "error": "该模型正在下载中", "model_id": model_id}
 
         url = ""
         size_hint = 0.0
+        filename = ""
         with self._lock:
             for r in (self._rec_cache or []):
-                if r.entry.id == model_id:
-                    url = r.entry.download_url
-                    size_hint = r.estimated_size_gb
-                    break
+                if r.entry.id != model_id:
+                    continue
+                size_hint = r.estimated_size_gb
+                url = r.entry.download_url
+                filename = (url or "").rsplit("/", 1)[-1]
+                # 指定了量化版本时，从变体里挑对应的那份
+                if quant:
+                    for v in (r.entry.meta.get("variants") or []):
+                        if str(v.get("quant", "")).upper() == quant.upper():
+                            url = v.get("download_url") or url
+                            filename = v.get("filename") or filename
+                            size_hint = v.get("size_gb") or size_hint
+                            break
+                break
         if not url:
             return {"ok": False, "error": f"找不到模型的下载地址：{model_id}"}
 
-        dest = self.cfg.models_dir / f"{model_id.replace('/', '_')}.gguf"
+        safe = "".join(c for c in (filename or f"{model_id}.gguf") if c.isalnum()
+                       or c in "-_.")[:120]
+        dest = self.cfg.models_dir / safe
         state: dict[str, Any] = {
-            "model_id": model_id, "status": "downloading", "percent": 0.0,
-            "downloaded": 0, "total": 0, "error": "",
-            "dest": str(dest), "size_hint_gb": size_hint,
+            "model_id": model_id, "quant": quant, "status": "downloading",
+            "percent": 0.0, "downloaded": 0, "total": 0, "error": "",
+            "dest": str(dest), "size_hint_gb": size_hint, "filename": safe,
         }
         with self._lock:
-            self._downloads[model_id] = state
+            self._downloads[key] = state
 
         def worker() -> None:
             dl = Downloader()
@@ -1101,11 +1167,12 @@ def create_handler(server: ApiServer) -> type[BaseHTTPRequestHandler]:
                 self._handle_embeddings(payload)
             elif path == "/api/download":
                 mid = str(payload.get("model_id") or payload.get("id") or "").strip()
+                quant = str(payload.get("quant") or "").strip()
                 if not mid:
                     server.stats.count_request(failed=True)
                     self._send_error_json("缺少 model_id", "invalid_request_error", 400, "missing_model_id")
                     return
-                res = server.start_download(mid)
+                res = server.start_download(mid, quant)
                 self._send_json(res, 200 if res.get("ok") else 400)
                 server.stats.count_request(failed=not res.get("ok"))
             elif path == "/api/config":

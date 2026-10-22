@@ -706,6 +706,71 @@ def fetch_modelscope_models(
     return entries
 
 
+def group_by_model(entries: Iterable[ModelEntry]) -> list[dict[str, Any]]:
+    """把同一仓库的多个量化版本聚合成一条。
+
+    目录里同一个模型常有 Q4_K_M / Q5_K_M / Q8_0 等多份文件，
+    用户需要一次看清各版本的体积差异，而不是逐条翻。
+    返回的每条含 ``variants``（各量化版本）与 ``recommended``（推荐版本）。
+    """
+    buckets: dict[str, list[ModelEntry]] = {}
+    order: list[str] = []
+    for e in entries:
+        # 同一仓库的不同文件 id 相同，用 id 聚合
+        key = e.id
+        if key not in buckets:
+            buckets[key] = []
+            order.append(key)
+        buckets[key].append(e)
+
+    # 量化优先级：体积越小越靠前（Q4 < Q5 < Q6 < Q8）
+    quant_rank = {
+        "Q2_K": 10, "Q3_K_S": 20, "Q3_K_M": 25, "Q3_K_L": 30,
+        "Q4_0": 40, "Q4_K_S": 45, "Q4_K_M": 50,
+        "Q5_0": 60, "Q5_K_S": 65, "Q5_K_M": 70,
+        "Q6_K": 80, "Q8_0": 90,
+        "IQ1_S": 5, "IQ2_XXS": 8, "IQ2_XS": 12, "IQ3_XXS": 22,
+        "IQ4_XS": 48, "IQ4_NL": 52,
+        "F16": 100, "BF16": 95,
+    }
+
+    out: list[dict[str, Any]] = []
+    for key in order:
+        items = buckets[key]
+        items.sort(key=lambda x: (quant_rank.get(_quant_normalized_key(x.quant), 55),
+                                  x.size_gb))
+        best = items[0]
+        variants = [{
+            "quant": v.quant or "",
+            "size_gb": v.size_gb,
+            "params_b": v.params_b,
+            "ctx_len": v.ctx_len,
+            "id": v.id,
+            "download_url": v.download_url,
+            "sha256": v.sha256,
+            "filename": (v.download_url or "").rsplit("/", 1)[-1],
+        } for v in items]
+        out.append({
+            "id": best.id,
+            "name": best.name,
+            "family": best.family,
+            "params_b": best.params_b,
+            "ctx_len": best.ctx_len,
+            "size_gb": best.size_gb,
+            "download_url": best.download_url,
+            "repo_url": best.repo_url,
+            "description": best.description,
+            "variants": variants,
+            "recommended": variants[0]["quant"] if variants else "",
+        })
+    return out
+
+
+def _quant_normalized_key(quant: str) -> str:
+    """量化名归一化（大写、去空格），用于排序。"""
+    return (quant or "").replace(" ", "").upper()
+
+
 # --------------------------------------------------------------------------- #
 # 缓存
 # --------------------------------------------------------------------------- #
