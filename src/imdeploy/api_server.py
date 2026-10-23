@@ -348,7 +348,12 @@ async function pollRuntime(){
     const d = await r.json();
     const log = (d.log || []).slice(-8).map(l => '  ' + l).join('\n');
     if(d.installing){
-      box.innerHTML = '<pre class="logbox" style="max-height:180px;overflow:auto">' + log + '</pre>';
+      const pct = d.percent || 0;
+      const bar = '<div style="background:var(--panel2);border-radius:4px;height:8px;margin:8px 0;overflow:hidden">'
+        + '<div style="width:' + pct + '%;height:100%;background:var(--accent);transition:width .3s"></div></div>';
+      const size = d.total ? (fmtMB(d.downloaded) + ' / ' + fmtMB(d.total) + '　' + pct.toFixed(0) + '%') : '';
+      box.innerHTML = bar + (size ? '<div class="tip" style="margin-bottom:6px">' + size + '</div>' : '')
+        + '<pre class="logbox" style="max-height:180px;overflow:auto">' + log + '</pre>';
       setTimeout(pollRuntime, 1500);
     } else {
       const res = d.result || {};
@@ -606,6 +611,11 @@ function fmtETA(sec){
   if(sec < 60) return sec + ' 秒';
   if(sec < 3600) return Math.round(sec/60) + ' 分钟';
   return (sec/3600).toFixed(1) + ' 小时';
+}
+function fmtMB(bytes){
+  if(!bytes) return '0 MB';
+  const mb = bytes / 1048576;
+  return mb >= 1024 ? (mb/1024).toFixed(2) + ' GB' : mb.toFixed(1) + ' MB';
 }
 
 loadStatus(); loadModels(); pollDownloads(); loadConfig(); loadRuntime();
@@ -1180,6 +1190,9 @@ class ApiServer:
 
             self._runtime_installing = True
             self._runtime_log = []
+            self._runtime_dl_done = 0
+            self._runtime_dl_total = 0
+            self._runtime_info = {}
 
         def on_log(msg: str) -> None:
             with self._lock:
@@ -1187,6 +1200,9 @@ class ApiServer:
                 del self._runtime_log[:-50]
 
         def on_progress(done: int, total: int) -> None:
+            with self._lock:
+                self._runtime_dl_done = int(done)
+                self._runtime_dl_total = int(total)
             if total > 0:
                 on_log(f"下载中 {done * 100.0 / total:.0f}%（{done / 1048576:.1f}/"
                        f"{total / 1048576:.1f} MB）")
@@ -1229,11 +1245,16 @@ class ApiServer:
 
     def runtime_progress(self) -> dict[str, Any]:
         with self._lock:
+            done = int(getattr(self, "_runtime_dl_done", 0) or 0)
+            total = int(getattr(self, "_runtime_dl_total", 0) or 0)
             return {
                 "ok": True,
                 "installing": bool(self._runtime_installing),
                 "log": list(self._runtime_log),
                 "result": dict(self._runtime_info or {}),
+                "downloaded": done,
+                "total": total,
+                "percent": round(done * 100.0 / total, 1) if total > 0 else 0.0,
             }
 
     def update_config(self, updates: dict[str, Any]) -> dict[str, Any]:
