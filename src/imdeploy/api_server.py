@@ -111,6 +111,25 @@ height:180px;overflow-y:auto;font-family:Consolas,monospace;font-size:12px;color
     <button class="primary" onclick="loadRecs(true)">重新推荐</button>
     <span class="tip" id="recTip">点「重新推荐」从模型站抓取并匹配</span>
   </div>
+  <div class="row" style="margin-top:8px">
+    <label class="tip" for="fCtx">最小上下文</label>
+    <select id="fCtx" onchange="loadRecs(false)">
+      <option value="4096">4K</option>
+      <option value="8192">8K</option>
+      <option value="32768" selected>32K</option>
+      <option value="131072">128K</option>
+    </select>
+    <label class="tip" for="fSize">体积上限</label>
+    <select id="fSize" onchange="loadRecs(false)">
+      <option value="0">不限</option>
+      <option value="2">2 GB</option>
+      <option value="5">5 GB</option>
+      <option value="10">10 GB</option>
+      <option value="20">20 GB</option>
+    </select>
+    <input id="fFamily" placeholder="系列筛选，如 qwen / llama" style="max-width:200px"
+           onchange="loadRecs(false)">
+  </div>
   <table>
     <thead><tr><th>模型</th><th>档位</th><th>参数量</th><th>上下文</th><th>体积</th><th>操作</th></tr></thead>
     <tbody id="recBody"><tr><td colspan="6" style="color:var(--dim)">尚未加载推荐列表</td></tr></tbody>
@@ -456,7 +475,15 @@ async function ask(){
 async function loadRecs(refresh){
   $('recTip').textContent = refresh ? '正在抓取模型目录，可能需要十几秒…' : '加载中…';
   try{
-    const r = await fetch(base + '/api/recommend?limit=20&refresh=' + (refresh ? 1 : 0));
+    const ctxSel = $('fCtx'), sizeSel = $('fSize'), famEl = $('fFamily');
+    const minCtx = ctxSel ? ctxSel.value : '4096';
+    const maxSize = sizeSel ? sizeSel.value : '0';
+    const fam = famEl ? famEl.value.trim() : '';
+    const qs = 'limit=40&refresh=' + (refresh ? 1 : 0)
+      + '&min_ctx=' + encodeURIComponent(minCtx)
+      + '&max_size=' + encodeURIComponent(maxSize)
+      + '&family=' + encodeURIComponent(fam);
+    const r = await fetch(base + '/api/recommend?' + qs);
     const d = await r.json();
     if(!d.ok){ $('recTip').textContent = '失败：' + (d.error?.message || '未知错误'); return; }
     const ms = d.models || [];
@@ -811,7 +838,8 @@ class ApiServer:
     # ---------------- 模型目录 / 推荐 / 下载 ----------------
 
     def get_recommendations(self, limit: int = 20, min_ctx: int = 4096,
-                            refresh: bool = False) -> list[dict[str, Any]]:
+                            refresh: bool = False, max_size_gb: float = 0.0,
+                            family: str = "") -> list[dict[str, Any]]:
         """返回按本机硬件排序的推荐模型。结果缓存，避免每次重复抓取。"""
         from .catalog import build_catalog
         from .hardware import detect
@@ -836,6 +864,15 @@ class ApiServer:
                 self._hw_cache = hw
 
         recs = recommend(cat, hw, limit=limit, min_ctx=min_ctx)
+
+        # 额外筛选：体积上限 / 模型系列（在推荐结果上叠加）
+        if max_size_gb and max_size_gb > 0:
+            recs = [r for r in recs
+                    if (r.estimated_size_gb or r.entry.size_gb or 0) <= max_size_gb]
+        if family:
+            fam = family.lower()
+            recs = [r for r in recs if fam in str(r.entry.family or "").lower()]
+
         with self._lock:
             self._rec_cache = recs
 
@@ -1395,8 +1432,15 @@ def create_handler(server: ApiServer) -> type[BaseHTTPRequestHandler]:
                     limit = int((q.get("limit") or ["20"])[0])
                     min_ctx = int((q.get("min_ctx") or ["4096"])[0])
                     refresh = (q.get("refresh") or ["0"])[0] in ("1", "true", "yes")
-                    data = server.get_recommendations(limit=limit, min_ctx=min_ctx,
-                                                      refresh=refresh)
+                    try:
+                        max_size = float((q.get("max_size") or ["0"])[0])
+                    except ValueError:
+                        max_size = 0.0
+                    fam = (q.get("family") or [""])[0]
+                    data = server.get_recommendations(
+                        limit=limit, min_ctx=min_ctx, refresh=refresh,
+                        max_size_gb=max_size, family=fam,
+                    )
                 except Exception as exc:  # noqa: BLE001
                     self._send_error_json(f"获取推荐失败：{exc}", "api_error", 500, "recommend_failed")
                     return
