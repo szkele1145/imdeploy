@@ -538,12 +538,47 @@ async function pollDownloads(){
       const label = t.status === 'done' ? '已完成'
                   : t.status === 'error' ? ('失败：' + (t.error||''))
                   : (pct.toFixed(1) + '%');
-      var extra = '';
+      // 体积 / 速度 / 剩余时间
+      let detail = '';
+      if(t.status !== 'error'){
+        const parts = [];
+        if(t.total){
+          parts.push(fmtGB(t.downloaded) + ' / ' + fmtGB(t.total));
+        } else if(t.downloaded){
+          parts.push(fmtGB(t.downloaded));
+        }
+        if(t.speed_bps && t.status !== 'done'){
+          parts.push(fmtSpeed(t.speed_bps));
+        }
+        if(t.eta && t.status !== 'done'){
+          parts.push('剩余 ' + fmtETA(t.eta));
+        }
+        if(parts.length) detail = '<span class="tip">' + parts.join(' · ') + '</span>';
+      }
+      let extra = '';
       if(t.status === 'done') extra = ' <button onclick="loadModels()">刷新模型库</button>';
-      return '<div style="margin-bottom:10px"><b>' + t.model_id + '</b> '
-        + '<span style="color:' + color + '">' + label + '</span>' + extra + bar + '</div>';
+      if(t.status === 'error') extra = ' <button onclick="startDl(\'' + t.model_id.replace(/'/g,"\\'") + '\')">重试</button>';
+      return '<div style="margin-bottom:10px"><b>' + t.model_id
+        + (t.quant ? ' <span class="tip">(' + t.quant + ')</span>' : '') + '</b> '
+        + '<span style="color:' + color + '">' + label + '</span> ' + extra
+        + (detail ? '<br>' + detail : '') + bar + '</div>';
     }).join('');
   }catch(e){}
+}
+
+function fmtGB(bytes){
+  if(!bytes) return '0 MB';
+  const mb = bytes / 1048576;
+  return mb >= 1024 ? (mb/1024).toFixed(2) + ' GB' : mb.toFixed(0) + ' MB';
+}
+function fmtSpeed(bps){
+  const mb = bps / 1048576;
+  return mb >= 1 ? mb.toFixed(1) + ' MB/s' : (bps/1024).toFixed(0) + ' KB/s';
+}
+function fmtETA(sec){
+  if(sec < 60) return sec + ' 秒';
+  if(sec < 3600) return Math.round(sec/60) + ' 分钟';
+  return (sec/3600).toFixed(1) + ' 小时';
 }
 
 loadStatus(); loadModels(); pollDownloads(); loadConfig(); loadRuntime();
@@ -892,10 +927,29 @@ class ApiServer:
             dl = Downloader()
 
             def progress(task) -> None:
+                now = time.time()
                 with self._lock:
+                    prev_t = state.get("_t") or 0.0
+                    prev_b = state.get("_b") or 0
+                    # 用滑动窗口算速度，避免瞬时抖动
+                    if prev_t and now - prev_t >= 0.4 and task.downloaded >= prev_b:
+                        inst = (task.downloaded - prev_b) / (now - prev_t)
+                        old = state.get("speed_bps") or 0.0
+                        # 一阶低通，让读数稳定
+                        state["speed_bps"] = inst if not old else old * 0.6 + inst * 0.4
+                        state["_t"] = now
+                        state["_b"] = task.downloaded
+                    elif not prev_t:
+                        state["_t"] = now
+                        state["_b"] = task.downloaded
+
                     state["percent"] = round(task.percent, 1)
                     state["downloaded"] = task.downloaded
                     state["total"] = task.size
+
+                    speed = state.get("speed_bps") or 0.0
+                    remain = (task.size - task.downloaded) if task.size else 0
+                    state["eta"] = int(remain / speed) if (speed > 1024 and remain > 0) else 0
 
             try:
                 task = dl.download(url, dest, progress=progress)
@@ -913,7 +967,11 @@ class ApiServer:
 
     def download_status(self) -> dict[str, Any]:
         with self._lock:
-            return {k: dict(v) for k, v in self._downloads.items()}
+            # 内部计时用的下划线字段不对外暴露
+            return {
+                k: {kk: vv for kk, vv in v.items() if not kk.startswith("_")}
+                for k, v in self._downloads.items()
+            }
 
     # ---------------- 模型加载 / 卸载 ----------------
 
