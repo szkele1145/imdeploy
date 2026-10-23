@@ -77,6 +77,9 @@ background:var(--dim);top:2px;left:2px;transition:.2s}
 .sw input:checked + .track::after{left:20px;background:var(--accent)}
 h3{font-weight:600}
 .qsel{max-width:170px}
+.logbox{background:#0a0d12;border:1px solid var(--border);border-radius:8px;padding:12px;
+max-height:220px;overflow-y:auto;font-family:Consolas,monospace;font-size:12px;
+color:var(--dim);white-space:pre-wrap;margin:0}
 table{width:100%;border-collapse:collapse;font-size:13px}
 th{text-align:left;padding:8px 10px;color:var(--dim);font-weight:500;border-bottom:1px solid var(--border);font-size:12px}
 td{padding:8px 10px;border-bottom:1px solid rgba(48,54,61,.5)}
@@ -124,6 +127,15 @@ height:180px;overflow-y:auto;font-family:Consolas,monospace;font-size:12px;color
     <span class="tip" id="cfgTip"></span>
   </div>
   <div id="cfgBox"><span class="tip">正在读取配置…</span></div>
+</div>
+
+<div class="card">
+  <h2>推理运行库
+    <span class="right">
+      <button onclick="installRuntime()" id="btnRuntime">一键安装</button>
+    </span>
+  </h2>
+  <div id="runtimeBox"><span class="tip">正在检测…</span></div>
 </div>
 
 <div class="card">
@@ -261,6 +273,77 @@ async function loadStatus(){
     $('status').textContent = '服务异常';
     $('status').className = 'badge off';
     $('statusKv').innerHTML = '<dt>错误</dt><dd>' + e + '</dd>';
+  }
+}
+
+async function loadRuntime(){
+  const box = document.getElementById('runtimeBox');
+  const btn = document.getElementById('btnRuntime');
+  try{
+    const r = await fetch(base + '/api/runtime');
+    const d = await r.json();
+    if(d.installed){
+      box.innerHTML = '<div class="kv">'
+        + '<dt>状态</dt><dd style="color:var(--ok)">已就绪</dd>'
+        + '<dt>路径</dt><dd class="mono">' + (d.path || '-') + '</dd>'
+        + '<dt>可用后端</dt><dd>' + ((d.backends||[]).join('、') || '-') + '</dd>'
+        + '</div>';
+      btn.textContent = '重新安装';
+    } else {
+      box.innerHTML = '<div class="kv">'
+        + '<dt>状态</dt><dd style="color:var(--warn)">未安装</dd>'
+        + '<dt>说明</dt><dd>点击「一键安装」自动下载并配置 llama-server，无需手动处理 PATH</dd>'
+        + '</div>';
+      btn.textContent = '一键安装';
+    }
+  }catch(e){
+    box.innerHTML = '<span class="tip">检测失败：' + e + '</span>';
+  }
+}
+
+async function installRuntime(){
+  const btn = document.getElementById('btnRuntime');
+  const box = document.getElementById('runtimeBox');
+  btn.disabled = true;
+  btn.textContent = '安装中…';
+  try{
+    const r = await fetch(base + '/api/install_runtime', {method:'POST'});
+    const d = await r.json();
+    if(!d.ok){ box.innerHTML = '<span class="tip">启动失败：' + (d.error||'') + '</span>'; btn.disabled=false; return; }
+    pollRuntime();
+  }catch(e){
+    box.innerHTML = '<span class="tip">请求失败：' + e + '</span>';
+    btn.disabled = false;
+  }
+}
+
+async function pollRuntime(){
+  const box = document.getElementById('runtimeBox');
+  const btn = document.getElementById('btnRuntime');
+  try{
+    const r = await fetch(base + '/api/runtime_progress');
+    const d = await r.json();
+    const log = (d.log || []).slice(-8).map(l => '  ' + l).join('\n');
+    if(d.installing){
+      box.innerHTML = '<pre class="logbox" style="max-height:180px;overflow:auto">' + log + '</pre>';
+      setTimeout(pollRuntime, 1500);
+    } else {
+      const res = d.result || {};
+      if(res.ok){
+        box.innerHTML = '<div class="kv">'
+          + '<dt>状态</dt><dd style="color:var(--ok)">安装完成</dd>'
+          + '<dt>说明</dt><dd>' + (res.message||'') + '</dd>'
+          + '<dt>路径</dt><dd class="mono">' + (res.path||'') + '</dd>'
+          + '</div>';
+        btn.disabled = false; btn.textContent = '重新安装';
+        loadStatus();
+      } else {
+        box.innerHTML = '<pre class="logbox">' + log + (res.message ? '\n  ' + res.message : '') + '</pre>';
+        btn.disabled = false; btn.textContent = '重试安装';
+      }
+    }
+  }catch(e){
+    btn.disabled = false; btn.textContent = '一键安装';
   }
 }
 
@@ -436,7 +519,7 @@ async function pollDownloads(){
   }catch(e){}
 }
 
-loadStatus(); loadModels(); pollDownloads(); loadConfig();
+loadStatus(); loadModels(); pollDownloads(); loadConfig(); loadRuntime();
 setInterval(loadStatus, 5000);
 setInterval(pollDownloads, 2000);
 </script>
@@ -514,6 +597,11 @@ class ApiServer:
         self._rec_cache: list[Any] | None = None
         self._hw_cache: Any = None
         self._downloads: dict[str, dict[str, Any]] = {}
+
+        # 推理运行库安装状态
+        self._runtime_installing = False
+        self._runtime_log: list[str] = []
+        self._runtime_info: dict[str, Any] = {}
 
     # ---------------- 后端 ----------------
 
@@ -876,6 +964,89 @@ class ApiServer:
                 for mid, v in self._loaded.items()
             }
 
+    # ---------------- 推理运行库（llama.cpp）自动安装 ----------------
+
+    def runtime_status(self) -> dict[str, Any]:
+        """检测推理运行库是否就绪。"""
+        from . import backends as backends_mod  # noqa: PLC0415
+
+        backends = backends_mod.detect_backends(self.cfg)
+        llama = next((b for b in backends if getattr(b, "name", "") == "llama.cpp"), None)
+        available = bool(llama and llama.is_available())
+        path = getattr(llama, "server_path", "") if llama else ""
+        return {
+            "ok": True,
+            "installed": available,
+            "path": path or "",
+            "backends": [getattr(b, "name", str(b)) for b in backends],
+        }
+
+    def install_runtime(self) -> dict[str, Any]:
+        """后台下载并安装 llama.cpp 运行库。"""
+        from .runtime_install import detect_accel, install_llama_runtime
+
+        with self._lock:
+            if self._runtime_installing:
+                return {"ok": False, "error": "运行库正在安装中，请稍候"}
+
+            self._runtime_installing = True
+            self._runtime_log = []
+
+        def on_log(msg: str) -> None:
+            with self._lock:
+                self._runtime_log.append(str(msg))
+                del self._runtime_log[:-50]
+
+        def on_progress(done: int, total: int) -> None:
+            if total > 0:
+                on_log(f"下载中 {done * 100.0 / total:.0f}%（{done / 1048576:.1f}/"
+                       f"{total / 1048576:.1f} MB）")
+            else:
+                on_log(f"下载中 {done / 1048576:.1f} MB")
+
+        def worker() -> None:
+            try:
+                accel = detect_accel()
+                on_log(f"检测到加速后端：{accel}")
+                info = install_llama_runtime(
+                    self.cfg.base_dir / "bin",
+                    proxy=str(self.cfg.get("app.proxy", "") or "") or None,
+                    progress=on_progress,
+                    log=on_log,
+                )
+                with self._lock:
+                    self._runtime_info = {
+                        "ok": info.ok,
+                        "message": info.message,
+                        "path": info.exe_path,
+                        "backend": info.backend,
+                        "version": info.version,
+                    }
+                    if info.ok:
+                        self.cfg.set("backend.llama_server", info.exe_path)
+                        try:
+                            self.cfg.save()
+                        except Exception:  # noqa: BLE001
+                            pass
+            except Exception as exc:  # noqa: BLE001
+                with self._lock:
+                    self._runtime_info = {"ok": False, "message": str(exc)}
+            finally:
+                with self._lock:
+                    self._runtime_installing = False
+
+        threading.Thread(target=worker, daemon=True).start()
+        return {"ok": True, "message": "已开始安装"}
+
+    def runtime_progress(self) -> dict[str, Any]:
+        with self._lock:
+            return {
+                "ok": True,
+                "installing": bool(self._runtime_installing),
+                "log": list(self._runtime_log),
+                "result": dict(self._runtime_info or {}),
+            }
+
     def update_config(self, updates: dict[str, Any]) -> dict[str, Any]:
         """更新配置（WebUI 表单提交），只接受已存在的键。"""
         if not isinstance(updates, dict):
@@ -1092,6 +1263,14 @@ def create_handler(server: ApiServer) -> type[BaseHTTPRequestHandler]:
                 self._send_json({"ok": True, "models": server.loaded_models()})
                 server.stats.count_request()
                 return
+            if path == "/api/runtime":
+                self._send_json(server.runtime_status())
+                server.stats.count_request()
+                return
+            if path == "/api/runtime_progress":
+                self._send_json(server.runtime_progress())
+                server.stats.count_request()
+                return
             if path in ("/", "/index.html", "/ui", "/docs"):
                 self._send_html(_WEBUI_HTML)
                 server.stats.count_request()
@@ -1191,6 +1370,10 @@ def create_handler(server: ApiServer) -> type[BaseHTTPRequestHandler]:
             elif path == "/api/unload_model":
                 mid = str(payload.get("model_id") or payload.get("id") or "").strip()
                 res = server.stop_model(mid)
+                self._send_json(res, 200 if res.get("ok") else 400)
+                server.stats.count_request(failed=not res.get("ok"))
+            elif path == "/api/install_runtime":
+                res = server.install_runtime()
                 self._send_json(res, 200 if res.get("ok") else 400)
                 server.stats.count_request(failed=not res.get("ok"))
             elif path.startswith("/api/") and len(path) > 5:
