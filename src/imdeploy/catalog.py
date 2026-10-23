@@ -874,6 +874,54 @@ def _dedupe(entries: Iterable[ModelEntry]) -> list[ModelEntry]:
     return out
 
 
+def search_models(query: str, limit: int = 30) -> list[ModelEntry]:
+    """跨源关键词搜索（HF 镜像回退 + ModelScope），去重合并、按相关性排序。
+
+    供 ``/api/search`` 使用：用户输入一个词，两边同时找。
+    """
+    q = (query or "").strip().lower()
+    if not q:
+        return []
+
+    collected: list[ModelEntry] = []
+
+    def _fetch_one(fetcher) -> list[ModelEntry]:
+        try:
+            return fetcher(q, limit * 2) or []
+        except TypeError:
+            try:
+                return fetcher(q) or []
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("搜索失败（%s）: %s",
+                               getattr(fetcher, "__name__", fetcher), exc)
+                return []
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("搜索失败（%s）: %s",
+                           getattr(fetcher, "__name__", fetcher), exc)
+            return []
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+        futs = [pool.submit(_fetch_one, f) for f in (fetch_hf_models, fetch_modelscope_models)]
+        for fut in concurrent.futures.as_completed(futs):
+            try:
+                collected.extend(fut.result())
+            except Exception:  # noqa: BLE001
+                continue
+
+    merged = _dedupe(collected)
+
+    # 关键词命中越多越靠前；平手时参数量大者优先
+    words = [w for w in q.split() if w]
+
+    def score(e: ModelEntry) -> tuple:
+        s = (e.id + " " + e.name).lower()
+        hit = sum(1 for w in words if w in s)
+        return (-hit, -(e.params_b or 0))
+
+    merged.sort(key=score)
+    return merged[:limit]
+
+
 def build_catalog(
     queries: Sequence[str] | None = None,
     use_cache: bool = True,

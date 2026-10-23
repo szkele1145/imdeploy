@@ -137,7 +137,19 @@ height:180px;overflow-y:auto;font-family:Consolas,monospace;font-size:12px;color
 </div>
 
 <div class="card">
-  <h2>下载进度</h2>
+  <h2>模型搜索（多源）</h2>
+  <div class="row">
+    <input id="srch" placeholder="搜索模型名，如 qwen2.5 7b gguf" style="flex:1" onkeydown="if(event.key==='Enter')searchModels()">
+    <button class="primary" onclick="searchModels()">搜索</button>
+    <span class="tip" id="srchTip"></span>
+  </div>
+  <table>
+    <thead><tr><th>模型</th><th>系列</th><th>参数量</th><th>上下文</th><th>体积</th><th>操作</th></tr></thead>
+    <tbody id="srchBody"><tr><td colspan="6" style="color:var(--dim)">输入关键词搜索 HuggingFace / ModelScope</td></tr></tbody>
+  </table>
+</div>
+
+<div class="card">
   <div id="dlBox"><span class="tip">暂无下载任务</span></div>
 </div>
 
@@ -536,6 +548,26 @@ async function startDl(mid){
     $('recTip').textContent = '已开始下载：' + mid;
     pollDownloads();
   }catch(e){ $('recTip').textContent = '请求失败：' + e; }
+}
+
+// 模型搜索（HuggingFace + ModelScope 多源）
+async function searchModels(){
+  const kw = $('srch').value.trim();
+  if(!kw){ $('srchBody').innerHTML = '<tr><td colspan="6" style="color:var(--dim)">输入关键词搜索 HuggingFace / ModelScope</td></tr>'; return; }
+  $('srchTip').textContent = '搜索中…';
+  try{
+    const r = await fetch(base + '/api/search?q=' + encodeURIComponent(kw) + '&limit=40');
+    const d = await r.json();
+    if(!d.ok){ $('srchTip').textContent = '失败：' + (d.error?.message||''); return; }
+    const ms = d.models || [];
+    if(!ms.length){ $('srchBody').innerHTML = '<tr><td colspan="6" style="color:var(--dim)">无结果</td></tr>'; $('srchTip').textContent=''; return; }
+    $('srchBody').innerHTML = ms.map(m => {
+      const mid = m.id.replace(/'/g,"\\'");
+      const sz = m.size_gb ? m.size_gb.toFixed(1) + ' GB' : '-';
+      return '<tr><td>' + m.id + ' <span class="tip">[' + (m.source||'') + ']</span></td><td>' + (m.family||'-') + '</td><td>' + (m.params_b||'-') + 'B</td><td>' + (m.ctx_len||'-') + '</td><td>' + sz + '</td><td><button onclick="startDl(\'' + mid + '\')">下载</button></td></tr>';
+    }).join('');
+    $('srchTip').textContent = '共 ' + ms.length + ' 个结果';
+  }catch(e){ $('srchTip').textContent = '请求失败：' + e; }
 }
 
 // 带量化版本下载
@@ -1468,7 +1500,56 @@ def create_handler(server: ApiServer) -> type[BaseHTTPRequestHandler]:
                 self._send_json({"ok": True, "count": len(data), "models": data})
                 server.stats.count_request()
                 return
-            if path == "/api/downloads":
+            if path in ("/api/recommend", "/api/catalog"):
+                q = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
+                try:
+                    limit = int((q.get("limit") or ["20"])[0])
+                    min_ctx = int((q.get("min_ctx") or ["4096"])[0])
+                    refresh = (q.get("refresh") or ["0"])[0] in ("1", "true", "yes")
+                    try:
+                        max_size = float((q.get("max_size") or ["0"])[0])
+                    except ValueError:
+                        max_size = 0.0
+                    fam = (q.get("family") or [""])[0]
+                    data = server.get_recommendations(
+                        limit=limit, min_ctx=min_ctx, refresh=refresh,
+                        max_size_gb=max_size, family=fam,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    self._send_error_json(f"获取推荐失败：{exc}", "api_error", 500, "recommend_failed")
+                    return
+                self._send_json({"ok": True, "count": len(data), "models": data})
+                server.stats.count_request()
+                return
+            if path == "/api/search":
+                q = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
+                kw = (q.get("q") or q.get("keyword") or [""])[0].strip()
+                try:
+                    limit = int((q.get("limit") or ["40"])[0])
+                except ValueError:
+                    limit = 40
+                try:
+                    from . import catalog  # noqa: PLC0415
+                    items = catalog.search_models(kw, limit=limit)
+                    out = []
+                    for it in items:
+                        out.append({
+                            "id": it.id,
+                            "name": it.name,
+                            "family": it.family,
+                            "params_b": it.params_b,
+                            "quant": it.quant,
+                            "ctx_len": it.ctx_len,
+                            "size_gb": it.size_gb,
+                            "download_url": it.download_url,
+                            "source": it.source,
+                            "repo_url": it.repo_url,
+                        })
+                    self._send_json({"ok": True, "count": len(out), "models": out})
+                except Exception as exc:  # noqa: BLE001
+                    self._send_error_json(f"搜索失败：{exc}", "api_error", 500, "search_failed")
+                server.stats.count_request()
+                return
                 self._send_json({"ok": True, "tasks": server.download_status()})
                 server.stats.count_request()
                 return
