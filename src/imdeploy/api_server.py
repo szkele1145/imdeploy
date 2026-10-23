@@ -77,6 +77,9 @@ background:var(--dim);top:2px;left:2px;transition:.2s}
 .sw input:checked + .track::after{left:20px;background:var(--accent)}
 h3{font-weight:600}
 .qsel{max-width:170px}
+.btnrow{display:inline-flex;gap:6px}
+button.danger{background:#3a1d22;border-color:#5c2b32;color:#ff9aa5}
+button.danger:hover{background:#4a2429}
 .logbox{background:#0a0d12;border:1px solid var(--border);border-radius:8px;padding:12px;
 max-height:220px;overflow-y:auto;font-family:Consolas,monospace;font-size:12px;
 color:var(--dim);white-space:pre-wrap;margin:0}
@@ -171,6 +174,7 @@ height:180px;overflow-y:auto;font-family:Consolas,monospace;font-size:12px;color
 
 <script>
 const base = location.origin;
+let loadedIds = {};   // 已加载模型 id 集合，删除前判断要不要先卸载
 const $ = id => document.getElementById(id);
 
 function log(msg){
@@ -364,14 +368,18 @@ async function loadModels(){
       const ld = await lr.json();
       loaded = ld.models || {};
     }catch(e){}
+    loadedIds = loaded;
 
     $('modelBody').innerHTML = items.map(m => {
       const on = !!loaded[m.id];
-      const btn = on
-        ? '<button onclick="unloadModel(\'' + m.id.replace(/'/g,"\\'") + '\')">卸载</button>'
-        : '<button onclick="loadModel(\'' + m.id.replace(/'/g,"\\'") + '\')">加载</button>';
+      const safe = m.id.replace(/'/g, "\\'");
+      const loadBtn = on
+        ? '<button onclick="unloadModel(\'' + safe + '\')">卸载</button>'
+        : '<button onclick="loadModel(\'' + safe + '\')">加载</button>';
+      const delBtn = '<button class="danger" onclick="removeModel(\'' + safe + '\')">删除</button>';
       return '<tr><td>' + m.id + (on ? ' <span style="color:var(--ok)">● 已加载</span>' : '') + '</td>'
-        + '<td>-</td><td>-</td><td>-</td><td>-</td><td>' + btn + '</td></tr>';
+        + '<td>-</td><td>-</td><td>-</td><td>-</td>'
+        + '<td><span class="btnrow">' + loadBtn + delBtn + '</span></td></tr>';
     }).join('');
     $('modelTip').textContent = '共 ' + items.length + ' 个';
   }catch(e){
@@ -405,6 +413,25 @@ async function unloadModel(mid){
     });
     const d = await r.json();
     $('modelTip').textContent = d.ok ? ('已卸载 ' + mid) : ('卸载失败：' + (d.error || ''));
+    loadModels(); loadStatus();
+  }catch(e){ $('modelTip').textContent = '请求失败：' + e; }
+}
+
+// 删除模型（连文件一起删），删除前二次确认
+async function removeModel(mid){
+  if(!confirm('确定删除 ' + mid + ' 的模型文件？此操作不可恢复。')) return;
+  if(loadedIds && loadedIds[mid]){
+    $('modelTip').textContent = '模型正在加载中，先卸载再删…';
+    await unloadModel(mid);
+  }
+  $('modelTip').textContent = '正在删除 ' + mid + '…';
+  try{
+    const r = await fetch(base + '/api/library_remove', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({model_id: mid})
+    });
+    const d = await r.json();
+    $('modelTip').textContent = d.ok ? ('已删除 ' + mid) : ('删除失败：' + (d.error || ''));
     loadModels(); loadStatus();
   }catch(e){ $('modelTip').textContent = '请求失败：' + e; }
 }
@@ -1434,6 +1461,16 @@ def create_handler(server: ApiServer) -> type[BaseHTTPRequestHandler]:
                 server.stats.count_request(failed=not res.get("ok"))
             elif path == "/api/install_runtime":
                 res = server.install_runtime()
+                self._send_json(res, 200 if res.get("ok") else 400)
+                server.stats.count_request(failed=not res.get("ok"))
+            elif path == "/api/library_remove":
+                mid = str(payload.get("model_id") or payload.get("id") or "").strip()
+                if not mid:
+                    server.stats.count_request(failed=True)
+                    self._send_error_json("缺少 model_id", "invalid_request_error", 400, "missing_model_id")
+                    return
+                keep = bool(payload.get("keep_file"))
+                res = server.library_remove(mid, delete_file=not keep)
                 self._send_json(res, 200 if res.get("ok") else 400)
                 server.stats.count_request(failed=not res.get("ok"))
             elif path.startswith("/api/") and len(path) > 5:
