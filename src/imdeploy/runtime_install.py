@@ -17,11 +17,13 @@ import json
 import logging
 import os
 import platform
+import re
 import shutil
 import subprocess
 import sys
 import tempfile
 import urllib.error
+import urllib.parse
 import urllib.request
 import zipfile
 from dataclasses import dataclass
@@ -40,6 +42,29 @@ logger = logging.getLogger(__name__)
 
 UA = "imdeploy/0.1 (+https://github.com/szkele1145/imdeploy)"
 GITHUB_API = "https://api.github.com/repos/ggml-org/llama.cpp/releases/latest"
+GITHUB_RELEASES = "https://api.github.com/repos/ggml-org/llama.cpp/releases"
+RELEASES_PAGE = "https://github.com/ggml-org/llama.cpp/releases"
+RELEASES_LATEST = RELEASES_PAGE + "/latest"
+
+
+def _pick_binary_release(releases: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """从 release 列表里挑出真正带二进制资产的那个。
+
+    llama.cpp 的 ``/releases/latest`` 指向的往往是 ``v0.7.0`` 这种只挂
+    ``nightly-tag.txt`` 的空壳发布，真正的构建产物在 ``b12345`` 形式的 tag 上。
+    所以要按「有 bin 资产」来挑，不能只看 latest。
+    """
+    def has_bin(rel: dict[str, Any]) -> bool:
+        for a in rel.get("assets") or []:
+            name = str(a.get("name") or "").lower()
+            if "bin" in name and name.endswith(".zip"):
+                return True
+        return False
+
+    for rel in releases:
+        if has_bin(rel):
+            return rel
+    return None
 DEFAULT_PROXY = "http://127.0.0.1:65532"
 
 
@@ -105,15 +130,32 @@ def _platform_tag() -> str | None:
     return None
 
 
+def _arch_tag() -> str | None:
+    """返回资产名里的 CPU 架构标记：x64 / arm64。"""
+    machine = (platform.machine() or "").lower()
+    if machine in ("amd64", "x86_64", "x64"):
+        return "x64"
+    if machine in ("arm64", "aarch64"):
+        return "arm64"
+    return None
+
+
 def pick_release_asset(assets: list[dict[str, Any]], accel: str) -> dict[str, Any] | None:
     """从 release 资产里挑出最合适的一个。
 
     资产命名形如 ``llama-b4500-bin-win-cuda-x64.zip``、
     ``llama-b4500-bin-win-vulkan-x64.zip``、``llama-b4500-bin-win-cpu-x64.zip``。
+
+    架构必须严格匹配：在 x64 机器上装到 arm64 的包，运行时会报
+    “该版本的 %1 与你运行的 Windows 版本不兼容”（WinError 216）。
     """
     tag = _platform_tag()
     if not tag:
         return None
+    arch = _arch_tag()
+    if not arch:
+        return None
+    wrong_arch = "arm64" if arch == "x64" else "x64"
 
     # 只看 zip
     zips = [a for a in assets if str(a.get("name", "")).lower().endswith(".zip")]
@@ -125,6 +167,9 @@ def pick_release_asset(assets: list[dict[str, Any]], accel: str) -> dict[str, An
         if tag not in n:
             return -100
         if not n.startswith("llama-"):
+            return -100
+        # 架构硬性要求：必须含本机架构、且不含另一种架构
+        if arch not in n or wrong_arch in n:
             return -100
         s = 0
         if "bin" not in n:
@@ -138,11 +183,11 @@ def pick_release_asset(assets: list[dict[str, Any]], accel: str) -> dict[str, An
         for bad in ("cudart", "hip-", "sycl", "opencl"):
             if bad in n and accel != "cuda":
                 s -= 40
-        if "x64" in n or "arm64" in n:
-            s += 5
         return s
 
     ranked = sorted(zips, key=lambda a: score(a["name"]), reverse=True)
+    if not ranked:
+        return None
     best = ranked[0]
     return best if score(best["name"]) > -100 else None
 
@@ -156,10 +201,68 @@ def _opener(proxy: str | None):
     return urllib.request.build_opener(*handlers)
 
 
+def _gh_headers(accept: str = "application/vnd.github+json") -> dict[str, str]:
+    """GitHub 请求头。有 GITHUB_TOKEN 就带上，没授权的 60 次/小时很容易打满。"""
+    headers = {"User-Agent": UA, "Accept": accept}
+    token = (os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN") or "").strip()
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    return headers
+
+
 def _get_json(url: str, proxy: str | None, timeout: float = 30.0) -> Any:
-    req = urllib.request.Request(url, headers={"User-Agent": UA, "Accept": "application/vnd.github+json"})
+    req = urllib.request.Request(url, headers=_gh_headers())
     with _opener(proxy).open(req, timeout=timeout) as resp:
         return json.loads(resp.read().decode("utf-8"))
+
+
+def _get_text(url: str, proxy: str | None, timeout: float = 30.0) -> str:
+    req = urllib.request.Request(url, headers=_gh_headers("text/html"))
+    with _opener(proxy).open(req, timeout=timeout) as resp:
+        return resp.read().decode("utf-8", errors="replace")
+
+
+def _resolve_via_html(proxy: str | None) -> tuple[str, list[dict[str, str]]]:
+    """API 被限流时，改从 GitHub 网页解析版本与资产列表。
+
+    返回 ``(tag, [{"name", "browser_download_url"}, ...])``。
+    纯正则解析，不引第三方 HTML 解析库。
+    """
+    # 1) /releases/latest 会 302 到 /releases/tag/<tag>，从 Location 里拿 tag
+    req = urllib.request.Request(RELEASES_LATEST, headers=_gh_headers("text/html"),
+                                 method="HEAD")
+    tag = ""
+    try:
+        with _opener(proxy).open(req, timeout=30) as resp:
+            final = resp.geturl()
+            m = re.search(r"/releases/tag/([^/?#]+)", final)
+            if m:
+                tag = m.group(1)
+    except Exception:  # noqa: BLE001
+        pass
+
+    if not tag:
+        # HEAD 可能被拒，退回 GET 首页找 /releases/tag/xxx
+        html = _get_text(RELEASES_PAGE, proxy)
+        m = re.search(r'/releases/tag/([^"?#]+)', html)
+        if not m:
+            raise RuntimeError("无法从网页解析 llama.cpp 最新版本号")
+        tag = m.group(1)
+
+    # 2) expanded_assets 片段里有全部资产链接
+    html = _get_text(f"https://github.com/ggml-org/llama.cpp/releases/expanded_assets/{tag}",
+                     proxy)
+    assets: list[dict[str, str]] = []
+    for href in re.findall(r'href="(/ggml-org/llama\.cpp/releases/download/[^"]+)"', html):
+        name = href.rsplit("/", 1)[-1]
+        assets.append({
+            "name": urllib.parse.unquote(name),
+            "browser_download_url": f"https://github.com{href}",
+        })
+    if not assets:
+        raise RuntimeError(f"网页里没有解析到 {tag} 的资产列表")
+    return tag, assets
+
 
 
 def _download(url: str, dest: Path, proxy: str | None,
@@ -223,14 +326,31 @@ def install_llama_runtime(
     say(f"检测到加速后端：{accel}")
 
     try:
-        release = _get_json(GITHUB_API, proxy)
+        releases = _get_json(GITHUB_RELEASES + "?per_page=30", proxy)
+        release = _pick_binary_release(releases) if isinstance(releases, list) else None
+        if release is None:
+            # 兜底：退回 latest（某些版本可能确实挂在 latest 上）
+            release = _get_json(GITHUB_API, proxy)
+        version = str(release.get("tag_name") or "")
+        assets = release.get("assets") or []
     except urllib.error.HTTPError as exc:
-        return RuntimeInfo(False, message=f"查询 llama.cpp 版本失败（HTTP {exc.code}），请检查网络或代理设置")
+        # 未授权的 GitHub API 只有 60 次/小时，403/429 很常见 —— 改走网页解析
+        if exc.code in (403, 429):
+            say(f"GitHub API 限流（HTTP {exc.code}），改用网页解析…")
+            try:
+                version, assets = _resolve_via_html(proxy)
+            except Exception as exc2:  # noqa: BLE001
+                return RuntimeInfo(
+                    False,
+                    message=(f"查询 llama.cpp 版本失败（API HTTP {exc.code}，"
+                             f"网页兜底也失败：{exc2}）。"
+                             "可设置环境变量 GITHUB_TOKEN 提高配额，或手动下载"),
+                )
+        else:
+            return RuntimeInfo(False, message=f"查询 llama.cpp 版本失败（HTTP {exc.code}），请检查网络或代理设置")
     except Exception as exc:  # noqa: BLE001
         return RuntimeInfo(False, message=f"查询 llama.cpp 版本失败：{exc}")
 
-    version = str(release.get("tag_name") or "")
-    assets = release.get("assets") or []
     say(f"最新版本：{version}（共 {len(assets)} 个资产）")
 
     asset = pick_release_asset(assets, accel)
@@ -241,6 +361,16 @@ def install_llama_runtime(
     say(f"选中：{asset['name']}")
     target = Path(bin_dir) / "llama"
     target.mkdir(parents=True, exist_ok=True)
+
+    # 清掉旧版本残留：混着重装不同架构的 dll 会直接导致无法启动
+    for stale in target.iterdir():
+        try:
+            if stale.is_dir():
+                shutil.rmtree(stale, ignore_errors=True)
+            else:
+                stale.unlink(missing_ok=True)
+        except OSError:
+            pass
 
     tmp = Path(tempfile.mkdtemp(prefix="imdeploy-llama-"))
     zip_path = tmp / "runtime.zip"

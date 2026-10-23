@@ -603,6 +603,9 @@ class ApiServer:
         self._runtime_log: list[str] = []
         self._runtime_info: dict[str, Any] = {}
 
+        # 本地模型库缓存
+        self._library_cache: Any = None
+
     # ---------------- 后端 ----------------
 
     @property
@@ -964,7 +967,55 @@ class ApiServer:
                 for mid, v in self._loaded.items()
             }
 
-    # ---------------- 推理运行库（llama.cpp）自动安装 ----------------
+    # ---------------- 本地模型库 ----------------
+
+    def _library(self):
+        from .library import ModelLibrary  # noqa: PLC0415
+
+        with self._lock:
+            if self._library_cache is None:
+                self._library_cache = ModelLibrary(self.cfg)
+            return self._library_cache
+
+    def library_list(self) -> list[dict[str, Any]]:
+        try:
+            lib = self._library()
+        except Exception:  # noqa: BLE001
+            return []
+        out = []
+        for m in lib.list():
+            out.append({
+                "id": m.id,
+                "name": m.name,
+                "family": m.family,
+                "params_b": m.params_b,
+                "quant": m.quant,
+                "ctx_len": m.ctx_len,
+                "size_gb": m.size_gb,
+                "path": m.path,
+                "instruct": m.instruct,
+                "long_context": m.long_context,
+                "description": m.description,
+                "source": m.source,
+                "added_at": m.added_at,
+            })
+        return out
+
+    def library_scan(self) -> dict[str, Any]:
+        try:
+            lib = self._library()
+            added = lib.scan()
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": False, "error": str(exc)}
+        return {"ok": True, "added": len(added), "models": self.library_list()}
+
+    def library_remove(self, mid: str, delete_file: bool = True) -> dict[str, Any]:
+        try:
+            lib = self._library()
+            ok = lib.remove(mid, delete_file=delete_file)
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": False, "error": str(exc)}
+        return {"ok": bool(ok), "model_id": mid}
 
     def runtime_status(self) -> dict[str, Any]:
         """检测推理运行库是否就绪。"""
@@ -1263,6 +1314,15 @@ def create_handler(server: ApiServer) -> type[BaseHTTPRequestHandler]:
                 self._send_json({"ok": True, "models": server.loaded_models()})
                 server.stats.count_request()
                 return
+            if path == "/api/library":
+                self._send_json({"ok": True, "models": server.library_list()})
+                server.stats.count_request()
+                return
+            if path == "/api/library_scan":
+                res = server.library_scan()
+                self._send_json(res, 200 if res.get("ok") else 400)
+                server.stats.count_request(failed=not res.get("ok"))
+                return
             if path == "/api/runtime":
                 self._send_json(server.runtime_status())
                 server.stats.count_request()
@@ -1398,8 +1458,19 @@ def create_handler(server: ApiServer) -> type[BaseHTTPRequestHandler]:
         def _forward_or_error(self, model_id: str, upstream_path: str,
                              payload: dict[str, Any]
                              ) -> tuple[int, dict[str, Any]] | None:
-            """转发并处理通用错误；返回 None 表示已写回响应。"""
+            """转发并处理通用错误；返回 None 表示已写回响应。
+
+            llama-server 在模型加载完成前，``/v1/models`` 已经返回 200，
+            但推理接口会回 503 ``Loading model``。这里对这种情况做退避重试，
+            用户不必自己掐时间再点一次。
+            """
             status, data = server.forward_for_model(model_id, upstream_path, payload)
+            tries = 0
+            while status == 503 and _is_loading_model(data) and tries < 90:
+                tries += 1
+                time.sleep(1.0 if tries < 30 else 2.0)
+                status, data = server.forward_for_model(model_id, upstream_path, payload)
+
             if status == 0:
                 err = (data or {}).get("error") or {}
                 server.stats.count_request(failed=True)
@@ -1543,6 +1614,29 @@ def create_handler(server: ApiServer) -> type[BaseHTTPRequestHandler]:
 
 
 # ---------------------------------------------------------------- 响应归一化
+
+
+def _is_loading_model(data: Any) -> bool:
+    """判断上游 503 是不是「模型还在加载中」。
+
+    llama-server 加载权重期间会返回 ``{"error": {"message": "Loading model"}}``，
+    这种情况等一会儿就好，不是真的故障。
+    """
+    if not isinstance(data, dict):
+        return False
+    err = data.get("error")
+    if isinstance(err, dict):
+        msg = str(err.get("message") or "").lower()
+        code = str(err.get("code") or "").lower()
+    elif isinstance(err, str):
+        msg, code = err.lower(), ""
+    else:
+        msg, code = "", ""
+    if "loading" in msg or "loading" in code:
+        return True
+    # 有些版本放在顶层 message 里
+    top = str(data.get("message") or "").lower()
+    return "loading model" in top
 
 
 def _to_openai_chat(data: dict[str, Any], model_id: str) -> dict[str, Any]:

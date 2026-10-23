@@ -265,23 +265,66 @@ class LlamaCppBackend(Backend):
     # ---------------- 启动 / 停止 ----------------
 
     def _resolve_gguf(self, model_id: str, opts: dict[str, Any]) -> Path | None:
-        """定位模型权重文件。"""
+        """定位模型权重文件。
+
+        ``model_id`` 可能是三种形态，都要认：
+        1. 完整的绝对/相对文件路径（含 .gguf 后缀）
+        2. models 目录下的文件名（含后缀）
+        3. 不带后缀的模型名
+        """
         for key in ("gguf", "model_path", "path"):
             val = opts.get(key)
             if val:
                 p = Path(str(val)).expanduser()
                 if p.is_file():
                     return p
-        models_dir = self.cfg.models_dir
-        direct = models_dir / f"{model_id}.gguf"
-        if direct.is_file():
-            return direct
+
+        raw = str(model_id or "").strip()
+        if not raw:
+            return None
+
+        # 1) 直接当路径
         try:
+            p = Path(raw).expanduser()
+            if p.is_file():
+                return p
+        except OSError:
+            pass
+
+        models_dir = self.cfg.models_dir
+
+        # 2) models 目录下的同名文件（带后缀，比如 xxx.gguf）
+        try:
+            candidate = models_dir / raw
+            if candidate.is_file():
+                return candidate
+        except OSError:
+            pass
+
+        # 3) 补 .gguf 后缀
+        if not raw.lower().endswith(".gguf"):
+            try:
+                direct = models_dir / f"{raw}.gguf"
+                if direct.is_file():
+                    return direct
+            except OSError:
+                pass
+
+        # 4) 模糊匹配：按 stem 比对（用文件名而不是整个路径比）
+        target = Path(raw).stem if raw.lower().endswith(".gguf") else raw
+        target_lower = target.lower()
+        try:
+            exact, partial = [], []
             for f in models_dir.rglob("*.gguf"):
-                if f.stem.lower() == str(model_id).lower():
-                    return f
-                if str(model_id).lower() in f.stem.lower():
-                    return f
+                stem = f.stem.lower()
+                if stem == target_lower:
+                    exact.append(f)
+                elif target_lower and target_lower in stem:
+                    partial.append(f)
+            if exact:
+                return exact[0]
+            if partial:
+                return partial[0]
         except OSError:
             pass
         return None
