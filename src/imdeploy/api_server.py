@@ -1516,6 +1516,19 @@ def create_handler(server: ApiServer) -> type[BaseHTTPRequestHandler]:
                     "created": int(time.time()),
                     "owned_by": "local",
                 })
+            # 还没加载但本地已下载的也列出来（OpenWebUI/OpenRouter 等客户端会用）
+            try:
+                for lm in server.library_list():
+                    lid = str(lm.get("id") or "")
+                    if lid and lid not in model_ids:
+                        data.append({
+                            "id": lid,
+                            "object": "model",
+                            "created": int(time.time()),
+                            "owned_by": "local",
+                        })
+            except Exception:  # noqa: BLE001
+                pass
             # 去重
             seen: set[str] = set()
             unique: list[dict[str, Any]] = []
@@ -1524,6 +1537,7 @@ def create_handler(server: ApiServer) -> type[BaseHTTPRequestHandler]:
                     seen.add(item["id"])
                     unique.append(item)
             self._send_json({"object": "list", "data": unique})
+            self.send_header("Access-Control-Allow-Origin", "*")
             server.stats.count_request()
 
         # ---------------- POST ----------------
