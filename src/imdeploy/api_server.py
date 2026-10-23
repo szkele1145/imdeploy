@@ -952,10 +952,26 @@ class ApiServer:
                     state["eta"] = int(remain / speed) if (speed > 1024 and remain > 0) else 0
 
             try:
-                task = dl.download(url, dest, progress=progress)
+                # 多镜像回退：hf-mirror 挂了自动换 huggingface，反之亦然
+                attempts = _mirror_candidates(url)
+                last_err = ""
+                for idx, candidate in enumerate(attempts):
+                    if idx:
+                        with self._lock:
+                            state["mirror"] = candidate
+                            state["percent"] = 0.0
+                            state["downloaded"] = 0
+                            state["speed_bps"] = 0.0
+                            state["eta"] = 0
+                            state["_t"] = 0
+                            state["_b"] = 0
+                    task = dl.download(candidate, dest, progress=progress)
+                    if task.status == "done":
+                        break
+                    last_err = task.error or ""
                 with self._lock:
                     state["status"] = "done" if task.status == "done" else "error"
-                    state["error"] = task.error or ""
+                    state["error"] = task.error or last_err
                     state["percent"] = 100.0 if task.status == "done" else state["percent"]
             except Exception as exc:  # noqa: BLE001
                 with self._lock:
@@ -1709,6 +1725,27 @@ def create_handler(server: ApiServer) -> type[BaseHTTPRequestHandler]:
 
 
 # ---------------------------------------------------------------- 响应归一化
+
+
+def _mirror_candidates(url: str) -> list[str]:
+    """给出同一文件的多镜像地址，按尝试顺序排列。
+
+    国内直连 huggingface.co 基本不通，hf-mirror.com 偶尔也会抽风，
+    两个都试一遍比直接失败好得多。
+    """
+    if not url:
+        return []
+    out = [url]
+    pairs = [
+        ("hf-mirror.com", "huggingface.co"),
+        ("huggingface.co", "hf-mirror.com"),
+    ]
+    for src, dst in pairs:
+        if src in url:
+            alt = url.replace(src, dst, 1)
+            if alt not in out:
+                out.append(alt)
+    return out
 
 
 def _is_loading_model(data: Any) -> bool:
