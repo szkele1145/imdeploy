@@ -556,6 +556,12 @@ async function searchModels(){
   if(!kw){ $('srchBody').innerHTML = '<tr><td colspan="6" style="color:var(--dim)">输入关键词搜索 HuggingFace / ModelScope</td></tr>'; return; }
   $('srchTip').textContent = '搜索中…';
   try{
+    let existSet = new Set();
+    try{
+      const mr = await fetch(base + '/v1/models');
+      const md = await mr.json();
+      (md.data||[]).forEach(function(x){ if(x && x.id) existSet.add(x.id); });
+    }catch(e){}
     const r = await fetch(base + '/api/search?q=' + encodeURIComponent(kw) + '&limit=40');
     const d = await r.json();
     if(!d.ok){ $('srchTip').textContent = '失败：' + (d.error?.message||''); return; }
@@ -564,7 +570,10 @@ async function searchModels(){
     $('srchBody').innerHTML = ms.map(m => {
       const mid = m.id.replace(/'/g,"\\'");
       const sz = m.size_gb ? m.size_gb.toFixed(1) + ' GB' : '-';
-      return '<tr><td>' + m.id + ' <span class="tip">[' + (m.source||'') + ']</span></td><td>' + (m.family||'-') + '</td><td>' + (m.params_b||'-') + 'B</td><td>' + (m.ctx_len||'-') + '</td><td>' + sz + '</td><td><button onclick="startDl(\'' + mid + '\')">下载</button></td></tr>';
+      const exist = existSet.has(m.id);
+      const nameCell = m.id + ' <span class="tip">[' + (m.source||'') + ']</span>' + (exist ? ' <span style="color:var(--ok);font-size:11px">已下载</span>' : '');
+      const actBtn = exist ? '<button disabled>已存在</button>' : '<button onclick="startDl(\'' + mid + '\')">下载</button>';
+      return '<tr><td>' + nameCell + '</td><td>' + (m.family||'-') + '</td><td>' + (m.params_b||'-') + 'B</td><td>' + (m.ctx_len||'-') + '</td><td>' + sz + '</td><td>' + actBtn + '</td></tr>';
     }).join('');
     $('srchTip').textContent = '共 ' + ms.length + ' 个结果';
   }catch(e){ $('srchTip').textContent = '请求失败：' + e; }
