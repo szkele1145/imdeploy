@@ -596,15 +596,17 @@ async function pollDownloads(){
     $('dlBox').innerHTML = tasks.map(t => {
       const pct = t.percent || 0;
       const color = t.status === 'done' ? 'var(--ok)'
-                  : t.status === 'error' ? 'var(--err)' : 'var(--accent)';
+                  : t.status === 'error' ? 'var(--err)'
+                  : t.status === 'cancelled' ? 'var(--dim)' : 'var(--accent)';
       const bar = '<div style="background:var(--panel2);border-radius:4px;height:6px;margin-top:6px;overflow:hidden">'
         + '<div style="width:' + pct + '%;height:100%;background:' + color + ';transition:width .3s"></div></div>';
       const label = t.status === 'done' ? '已完成'
                   : t.status === 'error' ? ('失败：' + (t.error||''))
+                  : t.status === 'cancelled' ? '已取消'
                   : (pct.toFixed(1) + '%');
       // 体积 / 速度 / 剩余时间
       let detail = '';
-      if(t.status !== 'error'){
+      if(t.status !== 'error' && t.status !== 'cancelled'){
         const parts = [];
         if(t.total){
           parts.push(fmtGB(t.downloaded) + ' / ' + fmtGB(t.total));
@@ -621,12 +623,24 @@ async function pollDownloads(){
       }
       let extra = '';
       if(t.status === 'done') extra = ' <button onclick="loadModels()">刷新模型库</button>';
+      if(t.status === 'downloading') extra = ' <button class="danger" onclick="cancelDl(\'' + t.model_id.replace(/'/g,"\\'") + '\',\'' + (t.quant||'').replace(/'/g,"\\'") + '\')">取消</button>';
       if(t.status === 'error') extra = ' <button onclick="startDl(\'' + t.model_id.replace(/'/g,"\\'") + '\')">重试</button>';
+      if(t.status === 'cancelled') extra = ' <button onclick="startDl(\'' + t.model_id.replace(/'/g,"\\'") + '\')">重新下载</button>';
       return '<div style="margin-bottom:10px"><b>' + t.model_id
         + (t.quant ? ' <span class="tip">(' + t.quant + ')</span>' : '') + '</b> '
         + '<span style="color:' + color + '">' + label + '</span> ' + extra
         + (detail ? '<br>' + detail : '') + bar + '</div>';
     }).join('');
+  }catch(e){}
+}
+
+async function cancelDl(mid, quant){
+  try{
+    await fetch(base + '/api/download_cancel', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({model_id: mid, quant: quant || ''})
+    });
+    setTimeout(pollDownloads, 400);
   }catch(e){}
 }
 
@@ -728,6 +742,7 @@ class ApiServer:
         self._rec_cache: list[Any] | None = None
         self._hw_cache: Any = None
         self._downloads: dict[str, dict[str, Any]] = {}
+        self._download_handles: dict[str, Any] = {}
 
         # 推理运行库安装状态
         self._runtime_installing = False
@@ -1001,10 +1016,9 @@ class ApiServer:
         }
         with self._lock:
             self._downloads[key] = state
+            self._download_handles[key] = dl
 
         def worker() -> None:
-            dl = Downloader()
-
             def progress(task) -> None:
                 now = time.time()
                 with self._lock:
@@ -1047,18 +1061,50 @@ class ApiServer:
                     task = dl.download(candidate, dest, progress=progress)
                     if task.status == "done":
                         break
+                    if task.status == "cancelled":
+                        last_err = ""
+                        break
                     last_err = task.error or ""
-                with self._lock:
-                    state["status"] = "done" if task.status == "done" else "error"
-                    state["error"] = task.error or last_err
-                    state["percent"] = 100.0 if task.status == "done" else state["percent"]
             except Exception as exc:  # noqa: BLE001
                 with self._lock:
                     state["status"] = "error"
                     state["error"] = str(exc)
+                task = None
+            finally:
+                with self._lock:
+                    if task is not None:
+                        if task.status == "done":
+                            state["status"] = "done"
+                            state["error"] = ""
+                            state["percent"] = 100.0
+                        elif task.status == "cancelled":
+                            state["status"] = "cancelled"
+                            state["error"] = "已取消"
+                        else:
+                            state["status"] = "error"
+                            state["error"] = task.error or last_err
+                    self._download_handles.pop(key, None)
 
         threading.Thread(target=worker, daemon=True).start()
         return {"ok": True, "model_id": model_id, "dest": str(dest)}
+
+    def cancel_download(self, model_id: str, quant: str = "") -> dict[str, Any]:
+        key = f"{model_id}|{quant or ''}"
+        with self._lock:
+            dl = self._download_handles.get(key)
+            state = self._downloads.get(key)
+        if not dl and not state:
+            return {"ok": False, "error": "未找到下载任务"}
+        try:
+            if dl is not None:
+                dl.cancel()
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": False, "error": str(exc)}
+        with self._lock:
+            if state is not None:
+                state["status"] = "cancelled"
+                state["error"] = "正在取消…"
+        return {"ok": True}
 
     def download_status(self) -> dict[str, Any]:
         with self._lock:
@@ -1674,6 +1720,16 @@ def create_handler(server: ApiServer) -> type[BaseHTTPRequestHandler]:
                     return
                 res = server.start_download(mid, quant)
                 self._send_json(res, 200 if res.get("ok") else 400)
+                server.stats.count_request(failed=not res.get("ok"))
+            elif path == "/api/download_cancel":
+                mid = str(payload.get("model_id") or payload.get("id") or "").strip()
+                quant = str(payload.get("quant") or "").strip()
+                if not mid:
+                    server.stats.count_request(failed=True)
+                    self._send_error_json("缺少 model_id", "invalid_request_error", 400, "missing_model_id")
+                    return
+                res = server.cancel_download(mid, quant)
+                self._send_json(res, 200 if res.get("ok") else 404)
                 server.stats.count_request(failed=not res.get("ok"))
             elif path == "/api/config":
                 res = server.update_config(payload.get("config") or {})
