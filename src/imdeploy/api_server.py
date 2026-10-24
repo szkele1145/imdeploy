@@ -1685,7 +1685,6 @@ def create_handler(server: ApiServer) -> type[BaseHTTPRequestHandler]:
                     seen.add(item["id"])
                     unique.append(item)
             self._send_json({"object": "list", "data": unique})
-            self.send_header("Access-Control-Allow-Origin", "*")
             server.stats.count_request()
 
         # ---------------- POST ----------------
