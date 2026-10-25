@@ -1645,6 +1645,10 @@ def create_handler(server: ApiServer) -> type[BaseHTTPRequestHandler]:
                 self._send_json(server.runtime_progress())
                 server.stats.count_request()
                 return
+            if path == "/api/downloads":
+                self._send_json({"ok": True, "tasks": server.download_status()})
+                server.stats.count_request()
+                return
             if path in ("/", "/index.html", "/ui", "/docs"):
                 self._send_html(_WEBUI_HTML)
                 server.stats.count_request()
