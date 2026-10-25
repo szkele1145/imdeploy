@@ -389,9 +389,15 @@ async function pollRuntime(){
 
 async function loadModels(){
   try{
-    const r = await fetch(base + '/v1/models');
-    const d = await r.json();
-    const items = d.data || [];
+    const [mr, lrLib] = await Promise.all([
+      fetch(base + '/v1/models'),
+      fetch(base + '/api/library').catch(function(){ return {json:function(){ return Promise.resolve({ok:false,models:[]}); }}; })
+    ]);
+    const md = await mr.json();
+    const ldLib = await lrLib.json().catch(function(){ return {ok:false,models:[]}; });
+    const items = md.data || [];
+    const libMap = {};
+    (ldLib.models || []).forEach(function(x){ if(x && x.id) libMap[x.id] = x; });
     if(!items.length){
       $('modelBody').innerHTML = '<tr><td colspan="6" style="color:var(--dim)">暂无已下载模型，请把 GGUF 放进 models 目录</td></tr>';
       $('modelTip').textContent = '';
@@ -408,13 +414,19 @@ async function loadModels(){
 
     $('modelBody').innerHTML = items.map(m => {
       const on = !!loaded[m.id];
+      const lm = libMap[m.id] || {};
       const safe = m.id.replace(/'/g, "\\'");
       const loadBtn = on
         ? '<button onclick="unloadModel(\'' + safe + '\')">卸载</button>'
         : '<button onclick="loadModel(\'' + safe + '\')">加载</button>';
       const delBtn = '<button class="danger" onclick="removeModel(\'' + safe + '\')">删除</button>';
+      const fam = lm.family || '-';
+      const pb = (lm.params_b != null && lm.params_b !== '') ? lm.params_b + 'B' : '-';
+      const qv = lm.quant ? ' <span class="tip">(' + lm.quant + ')</span>' : '';
+      const ctx = (lm.ctx_len != null && lm.ctx_len !== '') ? lm.ctx_len : '-';
+      const sz = (lm.size_gb != null && lm.size_gb !== '') ? Number(lm.size_gb).toFixed(2) + ' GB' : '-';
       return '<tr><td>' + m.id + (on ? ' <span style="color:var(--ok)">● 已加载</span>' : '') + '</td>'
-        + '<td>-</td><td>-</td><td>-</td><td>-</td>'
+        + '<td>' + fam + '</td><td>' + pb + qv + '</td><td>' + ctx + '</td><td>' + sz + '</td>'
         + '<td><span class="btnrow">' + loadBtn + delBtn + '</span></td></tr>';
     }).join('');
     $('modelTip').textContent = '共 ' + items.length + ' 个';
