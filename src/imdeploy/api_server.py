@@ -455,7 +455,7 @@ async function unloadModel(mid){
 
 // 删除模型（连文件一起删），删除前二次确认
 async function removeModel(mid){
-  if(!confirm('确定删除 ' + mid + ' 的模型文件？此操作不可恢复。')) return;
+  if(!confirm('确定删除模型「' + mid + '」？\n\n这会从模型库中移除并删除对应的 GGUF 文件，此操作不可恢复。\n\n如只想临时卸载请使用「卸载」。')) return;
   if(loadedIds && loadedIds[mid]){
     $('modelTip').textContent = '模型正在加载中，先卸载再删…';
     await unloadModel(mid);
