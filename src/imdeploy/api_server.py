@@ -614,7 +614,9 @@ async function pollDownloads(){
     const d = await r.json();
     const tasks = Object.values(d.tasks || {});
     if(!tasks.length){ $('dlBox').innerHTML = '<span class="tip">暂无下载任务</span>'; return; }
-    $('dlBox').innerHTML = tasks.map(t => {
+    const hasDone = tasks.some(function(t){ return t.status === 'done' || t.status === 'error' || t.status === 'cancelled'; });
+    const head = hasDone ? '<div style="margin-bottom:8px"><button onclick="clearDl()">清除已完成</button></div>' : '';
+    $('dlBox').innerHTML = head + tasks.map(t => {
       const pct = t.percent || 0;
       const color = t.status === 'done' ? 'var(--ok)'
                   : t.status === 'error' ? 'var(--err)'
@@ -643,7 +645,7 @@ async function pollDownloads(){
         if(parts.length) detail = '<span class="tip">' + parts.join(' · ') + '</span>';
       }
       let extra = '';
-      if(t.status === 'done') extra = ' <button onclick="loadModels()">刷新模型库</button>';
+      if(t.status === 'done') extra = ' <button onclick="loadModels();pollDownloads()">刷新模型库</button>';
       if(t.status === 'downloading') extra = ' <button class="danger" onclick="cancelDl(\'' + t.model_id.replace(/'/g,"\\'") + '\',\'' + (t.quant||'').replace(/'/g,"\\'") + '\')">取消</button>';
       if(t.status === 'error') extra = ' <button onclick="startDl(\'' + t.model_id.replace(/'/g,"\\'") + '\')">重试</button>';
       if(t.status === 'cancelled') extra = ' <button onclick="startDl(\'' + t.model_id.replace(/'/g,"\\'") + '\')">重新下载</button>';
@@ -662,6 +664,13 @@ async function cancelDl(mid, quant){
       body: JSON.stringify({model_id: mid, quant: quant || ''})
     });
     setTimeout(pollDownloads, 400);
+  }catch(e){}
+}
+
+async function clearDl(){
+  try{
+    await fetch(base + '/api/download_clear', {method:'POST'});
+    pollDownloads();
   }catch(e){}
 }
 
@@ -1134,6 +1143,17 @@ class ApiServer:
                 k: {kk: vv for kk, vv in v.items() if not kk.startswith("_")}
                 for k, v in self._downloads.items()
             }
+
+    def download_clear_finished(self) -> dict[str, Any]:
+        with self._lock:
+            removed = []
+            for k, v in list(self._downloads.items()):
+                st = v.get("status")
+                if st in ("done", "error", "cancelled"):
+                    removed.append(k)
+                    self._downloads.pop(k, None)
+                    self._download_handles.pop(k, None)
+            return {"ok": True, "removed": len(removed)}
 
     # ---------------- 模型加载 / 卸载 ----------------
 
@@ -1755,6 +1775,10 @@ def create_handler(server: ApiServer) -> type[BaseHTTPRequestHandler]:
                 res = server.cancel_download(mid, quant)
                 self._send_json(res, 200 if res.get("ok") else 404)
                 server.stats.count_request(failed=not res.get("ok"))
+            elif path == "/api/download_clear":
+                res = server.download_clear_finished()
+                self._send_json(res)
+                server.stats.count_request()
             elif path == "/api/config":
                 res = server.update_config(payload.get("config") or {})
                 self._send_json(res, 200 if res.get("ok") else 400)
